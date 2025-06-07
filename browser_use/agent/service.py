@@ -167,6 +167,7 @@ class Agent(Generic[Context]):
 		enable_memory: bool = True,
 		memory_config: MemoryConfig | None = None,
 		source: str | None = None,
+		enhance_task: bool = True,
 	):
 		if page_extraction_llm is None:
 			page_extraction_llm = llm
@@ -183,6 +184,14 @@ class Agent(Generic[Context]):
 		self.llm = llm
 		self.controller = controller
 		self.sensitive_data = sensitive_data
+
+		# Enhance task if LLM is available
+		if self.llm and enhance_task:
+			try:
+				enhanced_task = self._enhance_task(self.task)
+				self.task = enhanced_task
+			except Exception as e:
+				self.logger.warning(f'Failed to enhance task: {e}. Using original task.')
 
 		self.settings = AgentSettings(
 			use_vision=use_vision,
@@ -1877,3 +1886,36 @@ class Agent(Generic[Context]):
 		# Update done action model too
 		self.DoneActionModel = self.controller.registry.create_action_model(include_actions=['done'], page=page)
 		self.DoneAgentOutput = AgentOutput.type_with_custom_actions(self.DoneActionModel)
+
+	def _enhance_task(self, task: str) -> str:
+		"""Enhance the task description to make it clearer and more actionable without over-specifying."""
+		system_msg = (
+			'You are a task clarification specialist. Your job is to improve task descriptions '
+			'to make them clearer and more actionable for a browser automation agent, while preserving '
+			'the user\'s original intent and avoiding unnecessary assumptions.\n\n'
+			'Guidelines for enhancement:\n'
+			'1. CLARIFY ambiguous terms or vague language\n'
+			'2. PRESERVE the user\'s flexibility and choices\n'
+			'3. ADD context only when the task is unclear\n'
+			'4. AVOID making specific assumptions about:\n'
+			'   - Exact websites to use (unless specified)\n'
+			'   - Specific data formats or values\n'
+			'   - Detailed step-by-step procedures\n'
+			'   - User preferences not mentioned\n'
+			'5. FOCUS on removing ambiguity, not adding specificity\n'
+			'6. If the task is already clear, return it unchanged\n\n'
+			'Examples:\n'
+			'- "Find information about cats" → "Find and collect information about cats from web sources"\n'
+			'- "Book a flight" → Keep as "Book a flight" (don\'t assume dates, destinations, preferences)\n'
+		)
+
+		try:
+			msg = [SystemMessage(content=system_msg), HumanMessage(content=task)]
+			response = self.llm.invoke(msg)
+			enhanced_task = response.content.strip()
+
+			self.logger.info(f"Task enhanced from: '{task}' to: '{enhanced_task}'")
+			return enhanced_task
+		except Exception as e:
+			self.logger.warning(f'Failed to enhance task: {e}')
+			return task
