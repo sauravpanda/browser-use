@@ -1892,10 +1892,10 @@ class Agent(Generic[Context]):
 		system_msg = (
 			'You are a task clarification specialist. Your job is to improve task descriptions '
 			'to make them clearer and more actionable for a browser automation agent, while preserving '
-			'the user\'s original intent and avoiding unnecessary assumptions.\n\n'
+			"the user's original intent and avoiding unnecessary assumptions.\n\n"
 			'Guidelines for enhancement:\n'
 			'1. CLARIFY ambiguous terms or vague language\n'
-			'2. PRESERVE the user\'s flexibility and choices\n'
+			"2. PRESERVE the user's flexibility and choices\n"
 			'3. ADD context only when the task is unclear\n'
 			'4. AVOID making specific assumptions about:\n'
 			'   - Exact websites to use (unless specified)\n'
