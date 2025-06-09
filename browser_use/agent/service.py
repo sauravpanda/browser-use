@@ -1901,7 +1901,7 @@ class Agent(Generic[Context]):
 			'3. For vague tasks, ask for clarification or provide basic structure\n'
 			'4. NEVER add assumptions about specific methods, websites, or procedures\n'
 			'5. Focus on clarifying WHAT constitutes success, not HOW to achieve it\n'
-			'6. Preserve the user\'s original scope - don\'t expand the task\n\n'
+			"6. Preserve the user's original scope - don't expand the task\n\n"
 			'Completion Criteria Clarification:\n'
 			'- "Get X" → "Locate and access X" (clarifies the endpoint)\n'
 			'- "Find the price" → "Find and display the current price" (clarifies what to do with the result)\n'
