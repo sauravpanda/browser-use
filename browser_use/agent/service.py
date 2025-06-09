@@ -185,13 +185,8 @@ class Agent(Generic[Context]):
 		self.controller = controller
 		self.sensitive_data = sensitive_data
 
-		# Enhance task if LLM is available
-		if self.llm and enhance_task:
-			try:
-				enhanced_task = self._enhance_task(self.task)
-				self.task = enhanced_task
-			except Exception as e:
-				self.logger.warning(f'Failed to enhance task: {e}. Using original task.')
+		# Store enhance_task flag for later use in run()
+		self._should_enhance_task = enhance_task
 
 		self.settings = AgentSettings(
 			use_vision=use_vision,
@@ -1348,6 +1343,14 @@ class Agent(Generic[Context]):
 		signal_handler.register()
 
 		try:
+			# Enhance task if LLM is available (moved from __init__ to avoid blocking event loop)
+			if self.llm and self._should_enhance_task:
+				try:
+					enhanced_task = await self._enhance_task_async(self.task)
+					self.task = enhanced_task
+				except Exception as e:
+					self.logger.warning(f'Failed to enhance task: {e}. Using original task.')
+
 			self._log_agent_run()
 
 			# Execute initial actions if provided
@@ -1887,31 +1890,35 @@ class Agent(Generic[Context]):
 		self.DoneActionModel = self.controller.registry.create_action_model(include_actions=['done'], page=page)
 		self.DoneAgentOutput = AgentOutput.type_with_custom_actions(self.DoneActionModel)
 
-	def _enhance_task(self, task: str) -> str:
-		"""Enhance the task description to make it clearer and more actionable without over-specifying."""
+	async def _enhance_task_async(self, task: str) -> str:
+		"""Enhance the task description only when needed to clarify completion criteria or resolve ambiguity."""
 		system_msg = (
-			'You are a task clarification specialist. Your job is to improve task descriptions '
-			'to make them clearer and more actionable for a browser automation agent, while preserving '
-			"the user's original intent and avoiding unnecessary assumptions.\n\n"
-			'Guidelines for enhancement:\n'
-			'1. CLARIFY ambiguous terms or vague language\n'
-			"2. PRESERVE the user's flexibility and choices\n"
-			'3. ADD context only when the task is unclear\n'
-			'4. AVOID making specific assumptions about:\n'
-			'   - Exact websites to use (unless specified)\n'
-			'   - Specific data formats or values\n'
-			'   - Detailed step-by-step procedures\n'
-			'   - User preferences not mentioned\n'
-			'5. FOCUS on removing ambiguity, not adding specificity\n'
-			'6. If the task is already clear, return it unchanged\n\n'
+			'You are a task enhancement specialist for a browser automation agent. Your goal is to improve task descriptions '
+			"to prevent premature completion while preserving the user's original intent.\n\n"
+			'Core Enhancement Principles:\n\n'
+			'1. PRESERVE all specific requirements, constraints, and criteria mentioned in the original task\n'
+			'2. ADD completion criteria: clarify what constitutes a "complete" and thorough result\n'
+			'3. For searches involving comparison words ("best", "lowest", "cheapest", "compare"), '
+			'emphasize that multiple options must be evaluated before concluding\n'
+			'4. For searches with specific filters or constraints, ensure all criteria are applied and checked\n'
+			'5. If the task could be satisfied with surface-level information, clarify that comprehensive '
+			'information gathering is expected\n'
+			'6. AVOID adding specific websites, procedures, or assumptions not mentioned in the original task\n'
+			'7. If the task is already clear and specific, return it unchanged\n\n'
+			'Enhancement Focus:\n'
+			'- Transform vague completion criteria into clear ones\n'
+			'- Prevent stopping at first partial result when comprehensive data is expected\n'
+			'- Ensure all user-specified constraints are properly applied\n\n'
 			'Examples:\n'
-			'- "Find information about cats" → "Find and collect information about cats from web sources"\n'
-			'- "Book a flight" → Keep as "Book a flight" (don\'t assume dates, destinations, preferences)\n'
+			'- "Find prices" → "Find and collect comprehensive pricing information to provide a complete comparison"\n'
+			'- "Find the cheapest option" → "Compare multiple options to identify the cheapest one that meets the criteria"\n'
+			'- "Book a hotel" → "Book a hotel" (already clear)\n'
+			'- "Get weather" → "Get current weather information" (minimal enhancement)\n'
 		)
 
 		try:
 			msg = [SystemMessage(content=system_msg), HumanMessage(content=task)]
-			response = self.llm.invoke(msg)
+			response = await self.llm.ainvoke(msg)
 			enhanced_task = response.content.strip()
 
 			self.logger.info(f"Task enhanced from: '{task}' to: '{enhanced_task}'")

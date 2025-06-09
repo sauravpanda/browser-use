@@ -5,13 +5,13 @@ This example demonstrates how the browser-use agent automatically enhances task 
 to make them more specific, actionable, and clear for browser automation.
 
 The task enhancement feature:
-1. Analyzes your original task description
+1. Analyzes your original task description during agent.run()
 2. Uses an LLM to make it more specific and actionable
 3. Adds context, constraints, and clear steps
 4. Provides better guidance for the automation agent
 
 Key features demonstrated:
-- Automatic task enhancement during agent initialization
+- Automatic task enhancement during agent execution
 - Comparing original vs enhanced tasks
 - Enabling/disabling task enhancement
 - Different types of tasks and their enhancements
@@ -35,79 +35,63 @@ from browser_use.browser import BrowserProfile, BrowserSession
 llm = ChatOpenAI(model='gpt-4o')
 
 
-async def demonstrate_comprehensive_enhancement():
-	"""Comprehensive demo showing task enhancement with comparison and execution."""
+async def demonstrate_task_enhancement_during_execution():
+	"""Demo showing task enhancement during agent execution."""
 
-	print('🧠 Task Enhancement Comprehensive Demo')
-	print('=' * 45)
+	print('🧠 Task Enhancement During Execution Demo')
+	print('=' * 50)
 
 	# Test cases that show clear enhancement benefits
 	test_tasks = ['Find iPhone prices', 'Book flight to Paris', 'Search for laptop deals under $1000']
 
+	print('📝 Original Tasks to be Enhanced:')
+	print('-' * 30)
+
+	for i, task in enumerate(test_tasks, 1):
+		print(f"{i}. '{task}'")
+
+	print('\n🚀 Executing Enhanced Tasks')
+	print('-' * 30)
+
 	async with BrowserSession(
 		browser_profile=BrowserProfile(
-			headless=True,  # Start headless for comparison
+			headless=False,  # Show browser for demonstration
 			window_size={'width': 1280, 'height': 1000},
 		)
 	) as browser_session:
-		print('📊 Comparing Original vs Enhanced Tasks:')
-		print('-' * 45)
+		# Demonstrate with the first task
+		original_task = test_tasks[0]
+		print(f"\n📍 Original Task: '{original_task}'")
 
-		enhanced_tasks = []
-
-		for i, original_task in enumerate(test_tasks, 1):
-			print(f"\n{i}. Original: '{original_task}'")
-
-			# Create agent with enhancement
-			agent = Agent(
-				task=original_task,
-				llm=llm,
-				browser_session=browser_session,
-				enhance_task=True,
-			)
-
-			enhanced_task = agent.task
-			enhanced_tasks.append((original_task, enhanced_task, agent))
-
-			print(f"   Enhanced: '{enhanced_task}'")
-
-			# Show improvement metrics
-			improvement = len(enhanced_task) - len(original_task)
-			print(f'   📏 Added {improvement} characters for clarity')
-
-		# Execute one enhanced task to show practical benefit
-		print('\n🚀 Executing Enhanced Task Demo')
-		print('-' * 45)
-
-		# Use the first task for execution demo
-		original_task, enhanced_task, agent = enhanced_tasks[0]
-
-		print(f"📝 Executing: '{enhanced_task}'")
-		print('🌐 Opening browser to demonstrate...')
-
-		# Switch to visible browser for execution
-		await browser_session.close()
-
-	# Create new visible browser session for execution
-	async with BrowserSession(
-		browser_profile=BrowserProfile(
-			headless=False,  # Show browser for execution
-			window_size={'width': 1280, 'height': 1000},
-		)
-	) as browser_session:
-		# Create agent for execution
-		execution_agent = Agent(
+		# Create agent with enhancement enabled
+		agent = Agent(
 			task=original_task,
 			llm=llm,
 			browser_session=browser_session,
-			enhance_task=True,
+			enhance_task=True,  # Enhancement will happen during run()
+			enable_memory=False,  # Disable memory to avoid database conflicts in demo
 		)
 
-		try:
-			print('🎯 Running enhanced task automation...')
-			history = await execution_agent.run(max_steps=5)
+		print(f"🔄 Task before run(): '{agent.task}'")
+		print('⚡ Starting agent.run() - task enhancement will happen now...')
 
-			if history.is_successful:
+		try:
+			# Task enhancement happens automatically at start of run()
+			history = await agent.run(max_steps=3)
+
+			print(f"✨ Task after enhancement: '{agent.task}'")
+
+			# Show the difference
+			if agent.task != original_task:
+				print('\n📊 Enhancement Analysis:')
+				print(f'   Original length: {len(original_task)} characters')
+				print(f'   Enhanced length: {len(agent.task)} characters')
+				print(f'   Added detail: {len(agent.task) - len(original_task)} characters')
+				print(f'   Enhancement factor: {len(agent.task) / len(original_task):.2f}x')
+			else:
+				print('   No enhancement was applied (task was already clear)')
+
+			if history.is_successful():
 				print('✅ Task completed successfully!')
 				print(f'📋 Final result: {history.final_result()}')
 			else:
@@ -116,24 +100,18 @@ async def demonstrate_comprehensive_enhancement():
 		except Exception as e:
 			print(f'⚠️ Demo stopped: {e}')
 
-		print('\n💡 Key Benefits Demonstrated:')
-		print('• Enhanced tasks provide clearer guidance to the agent')
-		print('• More specific instructions lead to better automation results')
-		print('• Task enhancement happens automatically - no extra work needed')
-		print('• Works with any browser automation task')
-
 
 async def main():
-	"""Main function to run the comprehensive demonstration."""
+	"""Main function to run all demonstrations."""
 
 	print('🌟 Browser-Use Task Enhancement Feature Demo')
-	print('=' * 50)
+	print('=' * 55)
 	print('This demo shows how the browser-use agent automatically enhances')
-	print('task descriptions to make them more specific and actionable.\n')
+	print('task descriptions during execution to make them more actionable.\n')
 
 	try:
-		# Run the comprehensive demonstration
-		await demonstrate_comprehensive_enhancement()
+		# Run the execution demonstration
+		await demonstrate_task_enhancement_during_execution()
 
 		print('\n🎉 Demo completed successfully!')
 

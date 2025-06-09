@@ -14,7 +14,7 @@ from browser_use.controller.service import Controller
 
 
 class TestTaskEnhancement:
-	"""Test suite for task enhancement functionality using the test_service.py methodology"""
+	"""Test suite for task enhancement functionality during agent.run()"""
 
 	@pytest.fixture
 	def mock_llm(self):
@@ -55,92 +55,71 @@ class TestTaskEnhancement:
 				screenshot='',
 			)
 		)
+		browser_session.get_current_page = AsyncMock()
+		browser_session.stop = AsyncMock()
 		return browser_session
 
-	def test_enhance_task_success(self, mock_llm, mock_controller, mock_browser_session):
+	def test_agent_initialization_with_enhance_task_flag(self, mock_llm, mock_controller, mock_browser_session):
 		"""
-		Test that task enhancement works correctly when LLM returns enhanced content.
+		Test that agent initialization stores the enhance_task flag correctly.
 
 		This test ensures that:
-		1. The _enhance_task method is called during agent initialization
-		2. The LLM receives the correct enhancement prompt
-		3. The enhanced task content is properly set
-		4. The original task is replaced with the enhanced version
+		1. The enhance_task flag is stored during initialization
+		2. Task enhancement does NOT happen during __init__
+		3. Original task is preserved until run() is called
 		"""
 		# Arrange
 		original_task = 'Go to Google and find OpenAI'
-		enhanced_content = 'Enhanced task: Navigate to Google.com, search for "OpenAI" in the search bar, and click on the first official OpenAI result'
-
-		mock_response = AIMessage(content=enhanced_content)
-		mock_llm.ainvoke.return_value = mock_response
-
-		# Mock the MessageManager and other dependencies to bypass LLM verification
-		with patch('browser_use.agent.service.MessageManager') as mock_message_manager, patch('asyncio.run') as mock_run:
-			mock_run.return_value = enhanced_content
-
-			# Act
-			agent = Agent(
-				task=original_task,
-				llm=mock_llm,
-				controller=mock_controller,
-				browser_session=mock_browser_session,
-			)
-
-			# Assert
-			assert agent.task != original_task
-			assert agent.task == enhanced_content
-			mock_run.assert_called_once()
-
-	def test_enhance_task_failure_fallback(self, mock_llm, mock_controller, mock_browser_session):
-		"""
-		Test that task enhancement falls back to original task when enhancement fails.
-
-		This test ensures that:
-		1. When LLM enhancement fails, the original task is preserved
-		2. No exceptions are raised during agent initialization
-		3. The agent continues to function with the original task
-		4. Error handling is graceful and doesn't break the agent
-		"""
-		# Arrange
-		original_task = 'Go to Google and find OpenAI'
-		mock_llm.ainvoke.side_effect = Exception('LLM enhancement failed')
 
 		# Mock the MessageManager and other dependencies
-		with patch('browser_use.agent.service.MessageManager') as mock_message_manager, patch('asyncio.run') as mock_run:
-			mock_run.side_effect = Exception('Enhancement failed')
-
+		with patch('browser_use.agent.service.MessageManager') as mock_message_manager:
 			# Act
 			agent = Agent(
 				task=original_task,
 				llm=mock_llm,
 				controller=mock_controller,
 				browser_session=mock_browser_session,
+				enhance_task=True,
+			)
+
+			# Assert - task should still be original after initialization
+			assert agent.task == original_task
+			assert agent._should_enhance_task is True
+			# LLM should NOT have been called during initialization
+			mock_llm.ainvoke.assert_not_called()
+
+	def test_agent_initialization_with_enhance_task_disabled(self, mock_llm, mock_controller, mock_browser_session):
+		"""
+		Test that agent initialization respects enhance_task=False.
+
+		This test ensures that:
+		1. The enhance_task flag is stored as False
+		2. Task enhancement will be skipped during run()
+		3. Original task is preserved
+		"""
+		# Arrange
+		original_task = 'Go to Google and find OpenAI'
+
+		# Mock the MessageManager and other dependencies
+		with patch('browser_use.agent.service.MessageManager') as mock_message_manager:
+			# Act
+			agent = Agent(
+				task=original_task,
+				llm=mock_llm,
+				controller=mock_controller,
+				browser_session=mock_browser_session,
+				enhance_task=False,
 			)
 
 			# Assert
 			assert agent.task == original_task
-			mock_run.assert_called_once()
-
-	@pytest.mark.skip(reason='Complex mocking required for None LLM case - test methodology established')
-	def test_enhance_task_no_llm(self, mock_controller, mock_browser_session):
-		"""
-		Test that task enhancement is skipped when no LLM is provided.
-
-		This test ensures that:
-		1. Agent can be created without an LLM
-		2. Task enhancement is skipped gracefully
-		3. Original task is preserved
-		4. No errors occur during initialization
-
-		Note: This test is skipped due to complex mocking requirements for the None LLM case.
-		The test methodology has been established and can be implemented when needed.
-		"""
-		pass
+			assert agent._should_enhance_task is False
+			mock_llm.ainvoke.assert_not_called()
 
 	@pytest.mark.asyncio
-	async def test_enhance_task_method_directly(self, mock_llm, mock_controller, mock_browser_session):
+	async def test_enhance_task_async_method_directly(self, mock_llm, mock_controller, mock_browser_session):
 		"""
-		Test the _enhance_task method directly with various scenarios.
+		Test the _enhance_task_async method directly with various scenarios.
 
 		This test ensures that:
 		1. The method correctly processes enhancement requests
@@ -166,7 +145,7 @@ class TestTaskEnhancement:
 			)
 
 			# Act
-			result = await agent._enhance_task(original_task)
+			result = await agent._enhance_task_async(original_task)
 
 			# Assert
 			assert result == enhanced_content
@@ -180,18 +159,50 @@ class TestTaskEnhancement:
 			for msg in call_args:
 				if hasattr(msg, 'content'):
 					prompt_content += str(msg.content)
-			assert 'enhance' in prompt_content.lower() or 'improve' in prompt_content.lower()
+			assert 'task clarification specialist' in prompt_content.lower() or 'enhance' in prompt_content.lower()
 			assert original_task in prompt_content
 
-	def test_enhance_task_with_message_manager_integration(self, mock_llm, mock_controller, mock_browser_session):
+	@pytest.mark.asyncio
+	async def test_enhance_task_async_failure_fallback(self, mock_llm, mock_controller, mock_browser_session):
 		"""
-		Test that enhanced task is properly integrated with MessageManager.
+		Test that _enhance_task_async handles failures gracefully.
 
 		This test ensures that:
-		1. Enhanced task is passed to MessageManager
-		2. Message history contains the enhanced task
-		3. Original task is not present in messages
-		4. Integration works seamlessly
+		1. When LLM enhancement fails, the original task is returned
+		2. No exceptions are raised during enhancement
+		3. Proper fallback behavior occurs
+		"""
+		# Arrange
+		original_task = 'Go to Google and find OpenAI'
+		mock_llm.ainvoke.side_effect = Exception('LLM enhancement failed')
+
+		# Mock the MessageManager and other dependencies
+		with patch('browser_use.agent.service.MessageManager') as mock_message_manager:
+			# Create agent
+			agent = Agent(
+				task='dummy task',
+				llm=mock_llm,
+				controller=mock_controller,
+				browser_session=mock_browser_session,
+			)
+
+			# Act
+			result = await agent._enhance_task_async(original_task)
+
+			# Assert - should fallback to original task
+			assert result == original_task
+			mock_llm.ainvoke.assert_called_once()
+
+	@pytest.mark.asyncio
+	async def test_task_enhancement_during_run_success(self, mock_llm, mock_controller, mock_browser_session):
+		"""
+		Test that task enhancement happens during agent.run() when enabled.
+
+		This test ensures that:
+		1. Enhancement happens at the start of run()
+		2. Agent task is updated with enhanced version
+		3. LLM is called for enhancement
+		4. Run continues with enhanced task
 		"""
 		# Arrange
 		original_task = 'Find Python tutorials'
@@ -200,14 +211,16 @@ class TestTaskEnhancement:
 		mock_response = AIMessage(content=enhanced_content)
 		mock_llm.ainvoke.return_value = mock_response
 
-		# Mock the MessageManager and dependencies
-		with patch('browser_use.agent.service.MessageManager') as mock_message_manager, patch('asyncio.run') as mock_run:
-			mock_run.return_value = enhanced_content
-
-			# Mock the message manager instance
-			mock_manager_instance = Mock()
-			mock_manager_instance.get_messages.return_value = [Mock(content=enhanced_content)]
-			mock_message_manager.return_value = mock_manager_instance
+		# Mock the run method dependencies
+		with (
+			patch('browser_use.agent.service.MessageManager') as mock_message_manager,
+			patch.object(Agent, 'step') as mock_step,
+			patch.object(Agent, 'close') as mock_close,
+			patch.object(Agent, '_log_agent_run') as mock_log_run,
+		):
+			# Mock step to return done immediately
+			mock_step.side_effect = Exception('Stopping after enhancement')
+			mock_close.return_value = AsyncMock()
 
 			# Act
 			agent = Agent(
@@ -215,42 +228,89 @@ class TestTaskEnhancement:
 				llm=mock_llm,
 				controller=mock_controller,
 				browser_session=mock_browser_session,
+				enhance_task=True,
 			)
 
-			# Assert
-			messages = agent.message_manager.get_messages()
-			task_message_found = False
-			for msg in messages:
-				if hasattr(msg, 'content'):
-					content = str(msg.content)
-					if enhanced_content in content:
-						task_message_found = True
-						break
+			# Task should still be original before run
+			assert agent.task == original_task
 
-			assert task_message_found, 'Enhanced task not found in message manager'
+			# Start run() which should trigger enhancement
+			try:
+				await agent.run(max_steps=1)
+			except Exception:
+				pass  # Expected due to our mock
 
-	def test_enhance_task_retry_mechanism(self, mock_llm, mock_controller, mock_browser_session):
+			# Assert enhancement happened
+			assert agent.task == enhanced_content
+			mock_llm.ainvoke.assert_called_once()
+
+	@pytest.mark.asyncio
+	async def test_task_enhancement_during_run_disabled(self, mock_llm, mock_controller, mock_browser_session):
 		"""
-		Test task enhancement retry mechanism for failed enhancements.
+		Test that task enhancement is skipped when enhance_task=False.
 
 		This test ensures that:
-		1. Retry is attempted when first enhancement fails
-		2. Fallback to original task after max retries
-		3. Proper error logging occurs
-		4. Agent remains functional after failures
+		1. Enhancement is skipped when disabled
+		2. Original task is preserved throughout run
+		3. LLM is not called for enhancement
+		"""
+		# Arrange
+		original_task = 'Find Python tutorials'
+
+		# Mock the run method dependencies
+		with (
+			patch('browser_use.agent.service.MessageManager') as mock_message_manager,
+			patch.object(Agent, 'step') as mock_step,
+			patch.object(Agent, 'close') as mock_close,
+			patch.object(Agent, '_log_agent_run') as mock_log_run,
+		):
+			# Mock step to return done immediately
+			mock_step.side_effect = Exception('Stopping after check')
+			mock_close.return_value = AsyncMock()
+
+			# Act
+			agent = Agent(
+				task=original_task,
+				llm=mock_llm,
+				controller=mock_controller,
+				browser_session=mock_browser_session,
+				enhance_task=False,
+			)
+
+			# Start run() which should NOT trigger enhancement
+			try:
+				await agent.run(max_steps=1)
+			except Exception:
+				pass  # Expected due to our mock
+
+			# Assert enhancement did NOT happen
+			assert agent.task == original_task
+			mock_llm.ainvoke.assert_not_called()
+
+	@pytest.mark.asyncio
+	async def test_task_enhancement_failure_during_run(self, mock_llm, mock_controller, mock_browser_session):
+		"""
+		Test graceful handling of enhancement failure during run().
+
+		This test ensures that:
+		1. When enhancement fails during run(), agent continues with original task
+		2. No exceptions bubble up to break the run
+		3. Warning is logged but execution continues
 		"""
 		# Arrange
 		original_task = 'Navigate to shopping site'
+		mock_llm.ainvoke.side_effect = Exception('Enhancement failed')
 
-		# Mock LLM to fail first time, succeed second time
-		enhanced_content = 'Enhanced: Navigate to Amazon.com, browse electronics section, and add laptop to cart'
-		mock_response = AIMessage(content=enhanced_content)
-
-		mock_llm.ainvoke.side_effect = [Exception('First failure'), mock_response]
-
-		# Mock the MessageManager and dependencies
-		with patch('browser_use.agent.service.MessageManager') as mock_message_manager, patch('asyncio.run') as mock_run:
-			mock_run.side_effect = [Exception('First failure'), enhanced_content]
+		# Mock the run method dependencies
+		with (
+			patch('browser_use.agent.service.MessageManager') as mock_message_manager,
+			patch.object(Agent, 'step') as mock_step,
+			patch.object(Agent, 'close') as mock_close,
+			patch.object(Agent, '_log_agent_run') as mock_log_run,
+		):
+			# Mock step to return done immediately
+			mock_step.side_effect = Exception('Stopping after enhancement failure')
+			mock_close.return_value = AsyncMock()
 
 			# Act
 			agent = Agent(
@@ -258,52 +318,18 @@ class TestTaskEnhancement:
 				llm=mock_llm,
 				controller=mock_controller,
 				browser_session=mock_browser_session,
+				enhance_task=True,
 			)
 
-			# Assert - should fallback to original task after failure
+			# Start run() - should handle enhancement failure gracefully
+			try:
+				await agent.run(max_steps=1)
+			except Exception:
+				pass  # Expected due to our mock
+
+			# Assert fallback to original task after failure
 			assert agent.task == original_task
-			assert mock_run.call_count == 1
-
-	def test_enhance_task_with_complex_scenarios(self, mock_llm, mock_controller, mock_browser_session):
-		"""
-		Test task enhancement with complex, multi-step tasks.
-
-		This test ensures that:
-		1. Complex tasks are properly enhanced
-		2. Multi-step workflows are preserved
-		3. Enhancement adds specific details
-		4. Task structure remains logical
-		"""
-		# Arrange
-		original_task = 'Book a flight and hotel'
-		enhanced_content = """Enhanced task: 
-        1. Navigate to travel booking site (like Expedia or Booking.com)
-        2. Search for flights from current location to destination
-        3. Select appropriate flight based on price and timing
-        4. Search for hotels near destination
-        5. Select hotel with good rating and reasonable price
-        6. Complete booking process for both flight and hotel"""
-
-		mock_response = AIMessage(content=enhanced_content)
-		mock_llm.ainvoke.return_value = mock_response
-
-		# Mock the MessageManager and dependencies
-		with patch('browser_use.agent.service.MessageManager') as mock_message_manager, patch('asyncio.run') as mock_run:
-			mock_run.return_value = enhanced_content
-
-			# Act
-			agent = Agent(
-				task=original_task,
-				llm=mock_llm,
-				controller=mock_controller,
-				browser_session=mock_browser_session,
-			)
-
-			# Assert
-			assert agent.task == enhanced_content
-			assert 'Navigate to travel booking site' in agent.task
-			assert 'Complete booking process' in agent.task
-			assert len(agent.task) > len(original_task)
+			mock_llm.ainvoke.assert_called_once()
 
 	def test_add_new_task_functionality(self, mock_llm, mock_controller, mock_browser_session):
 		"""
@@ -320,9 +346,7 @@ class TestTaskEnhancement:
 		new_task = 'New additional task'
 
 		# Mock the MessageManager and dependencies
-		with patch('browser_use.agent.service.MessageManager') as mock_message_manager, patch('asyncio.run') as mock_run:
-			mock_run.return_value = original_task  # No enhancement
-
+		with patch('browser_use.agent.service.MessageManager') as mock_message_manager:
 			# Mock the message manager instance
 			mock_manager_instance = Mock()
 			mock_manager_instance.add_new_task = Mock()
@@ -370,26 +394,42 @@ class TestTaskValidation:
 		controller.registry = registry
 		return controller
 
-	def test_task_validation_empty_task(self, mock_llm, mock_controller):
+	@pytest.fixture
+	def mock_browser_session(self):
+		browser_session = Mock(spec=BrowserSession)
+		browser_session.get_state_summary = AsyncMock()
+		browser_session.get_current_page = AsyncMock()
+		browser_session.stop = AsyncMock()
+		return browser_session
+
+	@pytest.mark.asyncio
+	async def test_task_validation_empty_task(self, mock_llm, mock_controller, mock_browser_session):
 		"""
 		Test that empty tasks are handled appropriately.
 
 		This test ensures that:
 		1. Empty tasks don't break agent initialization
-		2. Agent accepts empty tasks (they get enhanced)
+		2. Agent accepts empty tasks (they can get enhanced)
 		3. Agent remains in valid state
 		"""
-		# Mock the MessageManager and other dependencies
-		with patch('browser_use.agent.service.MessageManager') as mock_message_manager, patch('asyncio.run') as mock_run:
-			mock_run.return_value = 'Enhanced empty task'
+		# Arrange
+		mock_response = AIMessage(content='Enhanced empty task')
+		mock_llm.ainvoke.return_value = mock_response
 
-			# Act - empty tasks should work, they just get enhanced
-			agent = Agent(task='', llm=mock_llm, controller=mock_controller)
+		# Mock the MessageManager and other dependencies
+		with patch('browser_use.agent.service.MessageManager') as mock_message_manager:
+			# Act - empty tasks should work, they can get enhanced during run
+			agent = Agent(
+				task='', llm=mock_llm, controller=mock_controller, browser_session=mock_browser_session, enhance_task=True
+			)
+
+			# Test the enhancement method directly
+			result = await agent._enhance_task_async('')
 
 			# Assert
-			assert agent.task == 'Enhanced empty task'
+			assert result == 'Enhanced empty task'
 
-	def test_task_validation_very_long_task(self, mock_llm, mock_controller):
+	def test_task_validation_very_long_task(self, mock_llm, mock_controller, mock_browser_session):
 		"""
 		Test handling of very long task descriptions.
 
@@ -402,12 +442,33 @@ class TestTaskValidation:
 		long_task = 'Very long task ' * 1000  # Create a very long task
 
 		# Mock the MessageManager and other dependencies
-		with patch('browser_use.agent.service.MessageManager') as mock_message_manager, patch('asyncio.run') as mock_run:
-			mock_run.return_value = long_task  # No enhancement
-
-			# Act
-			agent = Agent(task=long_task, llm=mock_llm, controller=mock_controller)
+		with patch('browser_use.agent.service.MessageManager') as mock_message_manager:
+			# Act - disable enhancement for this test to check original task handling
+			agent = Agent(
+				task=long_task, llm=mock_llm, controller=mock_controller, browser_session=mock_browser_session, enhance_task=False
+			)
 
 			# Assert
 			assert agent.task == long_task
 			assert len(agent.task) == len(long_task)
+
+	def test_task_enhancement_flag_default_value(self, mock_llm, mock_controller, mock_browser_session):
+		"""
+		Test that the enhance_task parameter has the correct default value.
+
+		This test ensures that:
+		1. Default value for enhance_task is True
+		2. Enhancement is enabled by default
+		"""
+		# Mock the MessageManager and other dependencies
+		with patch('browser_use.agent.service.MessageManager') as mock_message_manager:
+			# Act - don't specify enhance_task to test default
+			agent = Agent(
+				task='test task',
+				llm=mock_llm,
+				controller=mock_controller,
+				browser_session=mock_browser_session,
+			)
+
+			# Assert - default should be True
+			assert agent._should_enhance_task is True
