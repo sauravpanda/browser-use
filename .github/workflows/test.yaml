@@ -41,6 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       IN_DOCKER: 'True'
+      ANONYMIZED_TELEMETRY: 'false'
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -90,6 +91,7 @@ jobs:
   evaluate-tasks:
     runs-on: ubuntu-latest
     env:
+      ANONYMIZED_TELEMETRY: 'false'
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

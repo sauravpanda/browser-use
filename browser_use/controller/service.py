@@ -86,7 +86,7 @@ class Controller(Generic[Context]):
 			search_url = f'https://www.google.com/search?q={params.query}&udm=14'
 
 			page = await browser_session.get_current_page()
-			if page.url in ('about:blank', 'https://www.google.com'):
+			if page.url.strip('/') == 'https://www.google.com':
 				await page.goto(search_url)
 				await page.wait_for_load_state()
 			else:
@@ -232,19 +232,37 @@ class Controller(Generic[Context]):
 			page_extraction_llm: BaseChatModel,
 			include_links: bool = False,
 		):
+			from functools import partial
+
 			import markdownify
 
 			strip = []
 			if not include_links:
 				strip = ['a', 'img']
 
-			content = markdownify.markdownify(await page.content(), strip=strip)
+			# Run markdownify in a thread pool to avoid blocking the event loop
+			loop = asyncio.get_event_loop()
+			page_html = await page.content()
+			markdownify_func = partial(markdownify.markdownify, strip=strip)
+			content = await loop.run_in_executor(None, markdownify_func, page_html)
 
 			# manually append iframe text into the content so it's readable by the LLM (includes cross-origin iframes)
 			for iframe in page.frames:
+				try:
+					await iframe.wait_for_load_state(timeout=5000)  # extra on top of already loaded page
+				except Exception as e:
+					pass
+
 				if iframe.url != page.url and not iframe.url.startswith('data:'):
 					content += f'\n\nIFRAME {iframe.url}:\n'
-					content += markdownify.markdownify(await iframe.content())
+					# Run markdownify in a thread pool for iframe content as well
+					try:
+						iframe_html = await iframe.content()
+						iframe_markdown = await loop.run_in_executor(None, markdownify_func, iframe_html)
+					except Exception as e:
+						logger.debug(f'Error extracting iframe content from within page {page.url}: {type(e).__name__}: {e}')
+						iframe_markdown = ''
+					content += iframe_markdown
 
 			prompt = 'Your task is to extract the content of the page. You will be given a page and a goal and you should extract all relevant information around this goal from the page. If the goal is vague, summarize the page. Respond in json format. Extraction goal: {goal}, Page: {page}'
 			template = PromptTemplate(input_variables=['goal', 'page'], template=prompt)
