@@ -1343,7 +1343,7 @@ class Agent(Generic[Context]):
 		signal_handler.register()
 
 		try:
-			# Enhance task if LLM is available (moved from __init__ to avoid blocking event loop)
+			# Enhance task if LLM is available
 			if self.llm and self._should_enhance_task:
 				try:
 					enhanced_task = await self._enhance_task_async(self.task)
