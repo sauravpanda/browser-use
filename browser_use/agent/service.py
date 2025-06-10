@@ -38,7 +38,7 @@ from browser_use.agent.message_manager.utils import (
 	is_model_without_tool_support,
 	save_conversation,
 )
-from browser_use.agent.prompts import AgentMessagePrompt, PlannerPrompt, SystemPrompt
+from browser_use.agent.prompts import AgentMessagePrompt, PlannerPrompt, SystemPrompt, TaskEnhancementPrompt
 from browser_use.agent.views import (
 	ActionResult,
 	AgentError,
@@ -1892,28 +1892,7 @@ class Agent(Generic[Context]):
 
 	async def _enhance_task_async(self, task: str) -> str:
 		"""Enhance the task description only when needed to clarify completion criteria or resolve ambiguity."""
-		system_msg = (
-			'You are a task enhancement specialist for a browser automation agent. Your role is to provide MINIMAL '
-			'clarification to help the agent understand completion criteria without adding unnecessary complexity.\n\n'
-			'Enhancement Guidelines:\n\n'
-			'1. For tasks with clear objectives but unclear completion criteria, add minimal clarification\n'
-			'2. For already specific tasks with clear endpoints, return unchanged\n'
-			'3. For vague tasks, ask for clarification or provide basic structure\n'
-			'4. NEVER add assumptions about specific methods, websites, or procedures\n'
-			'5. Focus on clarifying WHAT constitutes success, not HOW to achieve it\n'
-			"6. Preserve the user's original scope - don't expand the task\n\n"
-			'Completion Criteria Clarification:\n'
-			'- "Get X" → "Locate and access X" (clarifies the endpoint)\n'
-			'- "Find the price" → "Find and display the current price" (clarifies what to do with the result)\n'
-			'- "Book a hotel" → unchanged (already clear endpoint)\n'
-			'- "Login to email" → unchanged (already clear endpoint)\n\n'
-			'Examples:\n'
-			'- "Get the report from the final environmental impact statement for Jamaica Bus Depot expansion" → "Locate and access the final environmental impact statement report for the Jamaica Bus Depot expansion"\n'
-			'- "Find the cheapest flight to Paris" → "Find and identify the cheapest available flight to Paris"\n'
-			'- "Book a hotel in Paris for next week" → unchanged (already clear)\n'
-			'- "Find stuff" → "Find specific information (please clarify what you\'re looking for)"\n\n'
-			'Focus: Clarify completion criteria without adding complexity or assumptions.'
-		)
+		system_msg = TaskEnhancementPrompt.get_system_message()
 
 		try:
 			msg = [SystemMessage(content=system_msg), HumanMessage(content=task)]
