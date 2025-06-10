@@ -24,3 +24,4 @@ async def test_connection_via_cdp(monkeypatch):
 
 	await browser_session.close()
 	await browser.close()
+	await playwright.stop()

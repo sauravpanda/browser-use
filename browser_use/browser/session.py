@@ -63,6 +63,9 @@ logger = logging.getLogger('browser_use.browser.session')
 
 _GLOB_WARNING_SHOWN = False  # used inside _is_url_allowed to avoid spamming the logs with the same warning multiple times
 
+GLOBAL_PLAYWRIGHT_API_OBJECT = None  # never instantiate the playwright API object more than once per thread
+GLOBAL_PATCHRIGHT_API_OBJECT = None  # never instantiate the patchright API object more than once per thread
+
 
 def _log_glob_warning(domain: str, glob: str):
 	global _GLOB_WARNING_SHOWN
@@ -146,7 +149,8 @@ class BrowserSession(BaseModel):
 		revalidate_instances='always',
 		frozen=False,
 		arbitrary_types_allowed=True,
-		populate_by_name=True,
+		validate_by_alias=True,
+		validate_by_name=True,
 	)
 	# this class accepts arbitrary extra **kwargs in init because of the extra='allow' pydantic option
 	# they are saved on the model, then applied to self.browser_profile via .apply_session_overrides_to_profile()
@@ -417,34 +421,6 @@ class BrowserSession(BaseModel):
 								f'❌ Error terminating subprocess with browser_pid={self.browser_pid}: {type(e).__name__}: {e}'
 							)
 
-				# Close playwright if we own it
-				if self.playwright:
-					try:
-						# Add timeout to prevent hanging
-						async with asyncio.timeout(5):
-							await self.playwright.stop()
-						self.playwright = None
-					except TimeoutError:
-						self.logger.warning('⏱️ Timeout while stopping playwright API thread')
-						self.playwright = None
-					except Exception as e:
-						self.logger.debug(f'Error stopping playwright: {type(e).__name__}: {e}')
-						self.playwright = None
-					finally:
-						# Ensure playwright tasks are cancelled
-						try:
-							loop = asyncio.get_event_loop()
-							if loop and not loop.is_closed():
-								all_tasks = asyncio.all_tasks(loop)
-								for task in all_tasks:
-									if task.done():
-										continue
-									coro_str = str(task)
-									if 'Connection.run' in coro_str and 'playwright' in coro_str:
-										task.cancel()
-						except Exception:
-							pass
-
 				self._reset_connection_state()
 				# self.logger.debug('🛑 Shutdown complete.')
 
@@ -520,25 +496,38 @@ class BrowserSession(BaseModel):
 		Set up playwright library client object: usually the result of (await async_playwright().start())
 		Override to customize the set up of the playwright or patchright library object
 		"""
+		global GLOBAL_PLAYWRIGHT_API_OBJECT
+		global GLOBAL_PATCHRIGHT_API_OBJECT
+
 		if self.browser_profile.stealth:
-			# use patchright instead of playwright
-			self.playwright = self.playwright or (await async_patchright().start())
+			# use patchright + chrome when stealth=True
 			self.browser_profile.channel = self.browser_profile.channel or BrowserChannel.CHROME
 			self.logger.info(f'🕶️ Activated stealth mode using patchright {self.browser_profile.channel.name.lower()} browser...')
+			if not self.playwright:
+				if GLOBAL_PATCHRIGHT_API_OBJECT:
+					self.playwright = GLOBAL_PATCHRIGHT_API_OBJECT
+				else:
+					GLOBAL_PATCHRIGHT_API_OBJECT = await async_patchright().start()
+					self.playwright = GLOBAL_PATCHRIGHT_API_OBJECT
 
 			# check for stealth best-practices
 			if self.browser_profile.channel and self.browser_profile.channel != BrowserChannel.CHROME:
-				self.logger.info(' 🪄 For maximum stealth, (...) should be passed channel=None or BrowserChannel.CHROME')
+				self.logger.info(
+					' 🪄 For maximum stealth, BrowserSession(...) should be passed channel=None or BrowserChannel.CHROME'
+				)
 			if not self.browser_profile.user_data_dir:
-				self.logger.info(' 🪄 For maximum stealth, (...) should be passed a persistent user_data_dir=...')
+				self.logger.info(' 🪄 For maximum stealth, BrowserSession(...) should be passed a persistent user_data_dir=...')
 			if self.browser_profile.headless or not self.browser_profile.no_viewport:
-				self.logger.info(' 🪄 For maximum stealth, (...) should be passed headless=False & viewport=None')
+				self.logger.info(' 🪄 For maximum stealth, BrowserSession(...) should be passed headless=False & viewport=None')
 		else:
-			# default is standard playwright chromium (headful, or headless=new)
-			self.playwright = self.playwright or (await async_playwright().start())
+			# use playwright + chromium by default
 			self.browser_profile.channel = self.browser_profile.channel or BrowserChannel.CHROMIUM
-
-		# return self.playwright
+			if not self.playwright:
+				if GLOBAL_PLAYWRIGHT_API_OBJECT:
+					self.playwright = GLOBAL_PLAYWRIGHT_API_OBJECT
+				else:
+					GLOBAL_PLAYWRIGHT_API_OBJECT = await async_playwright().start()
+					self.playwright = GLOBAL_PLAYWRIGHT_API_OBJECT
 
 	async def setup_browser_via_passed_objects(self) -> None:
 		"""Override to customize the set up of the connection to an existing browser"""
@@ -1131,7 +1120,6 @@ class BrowserSession(BaseModel):
 		self.human_current_page = None
 		self._cached_clickable_element_hashes = None
 		self._cached_browser_state_summary = None
-		# Don't set playwright to None here - it should be explicitly stopped with playwright.stop()
 
 		if self.browser_pid:
 			try:
