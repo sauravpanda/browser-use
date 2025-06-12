@@ -655,16 +655,43 @@ async def reformat_agent_history(
 
 
 class Task:
-	def __init__(self, task_id, confirmed_task, website=None, reference_length=None, level=None, cluster_id=None):
+	def __init__(self, task_id, confirmed_task, **kwargs):
+		# Validate required fields
+		if not task_id:
+			raise ValueError('task_id is required and cannot be empty')
+		if not confirmed_task:
+			raise ValueError('confirmed_task is required and cannot be empty')
+
+		# Set required fields
 		self.task_id = task_id
 		self.confirmed_task = confirmed_task
-		self.website = website
-		self.reference_length = reference_length
-		self.level = level
-		self.cluster_id = cluster_id
+
+		# Set optional fields dynamically
+		# Known optional fields with defaults
+		self.website = kwargs.get('website', None)
+		self.reference_length = kwargs.get('reference_length', None)
+		self.level = kwargs.get('level', None)
+		self.cluster_id = kwargs.get('cluster_id', None)
+		self.login_cookie = kwargs.get('login_cookie', None)
+		self.login_type = kwargs.get('login_type', None)
+		self.category = kwargs.get('category', None)
+
+		# Store any additional optional fields
+		known_fields = {'website', 'reference_length', 'level', 'cluster_id', 'login_cookie', 'login_type', 'category'}
+		self.additional_fields = {k: v for k, v in kwargs.items() if k not in known_fields}
+
+		# Make all additional fields accessible as attributes
+		for key, value in self.additional_fields.items():
+			setattr(self, key, value)
 
 	def __str__(self):
-		return f'Task(task_id={self.task_id}, confirmed_task={self.confirmed_task}, website={self.website}, reference_length={self.reference_length}, level={self.level}, cluster_id={self.cluster_id})'
+		# Include main fields and indicate if there are additional fields
+		base_str = f'Task(task_id={self.task_id}, confirmed_task={self.confirmed_task}, website={self.website}, reference_length={self.reference_length}, level={self.level}, cluster_id={self.cluster_id}, login_cookie={self.login_cookie}, login_type={self.login_type}, category={self.category}'
+		if self.additional_fields:
+			additional_str = ', '.join(f'{k}={v}' for k, v in self.additional_fields.items())
+			base_str += f', {additional_str}'
+		base_str += ')'
+		return base_str
 
 	def __repr__(self):
 		return self.__str__()
@@ -1041,11 +1068,17 @@ async def setup_browser_session(task: Task, headless: bool) -> BrowserSession:
 
 	logger.debug(f'Browser setup: Initializing BrowserSession for task {task.task_id}')
 	browser_session = BrowserSession(
-		browser_profile=BrowserProfile(
-			user_data_dir=str(unique_user_data_dir),
-			headless=headless,
-			chromium_sandbox=False,
-		),
+		user_data_dir=str(unique_user_data_dir),
+		headless=headless,
+		chromium_sandbox=False,  # running in docker
+		# higher timeouts = higher success rates on long tail of slow sites or if on a slow CI server
+		# timeout=60_000,
+		# default_timeout=60_000,
+		# default_navigation_timeout=60_000,
+		# wait_for_network_idle_page_load_time=60.0,
+		# maximum_wait_page_load_time=60.0,
+		# wait_between_actions=0.5,
+		# ignore_https_errors=True,  # some eval tasks have http:// or broken https sites in them
 	)
 
 	# Start browser session
@@ -1778,9 +1811,9 @@ if __name__ == '__main__':
 		try:
 			tasks = [Task(**task_data) for task_data in fetched_task_data]
 			logger.info(f'Successfully loaded {len(tasks)} tasks from the server.')
-		except TypeError as e:
+		except (TypeError, ValueError) as e:
 			logger.error(
-				f'Error creating Task objects from fetched data. Ensure the data structure includes required fields (task_id, confirmed_task). Optional fields: website, reference_length, level, cluster_id. Error: {type(e).__name__}: {e}'
+				f'Error creating Task objects from fetched data. Ensure the data structure includes required fields (task_id, confirmed_task). Known optional fields: website, reference_length, level, cluster_id, login_cookie, login_type, category. Any additional fields will be accepted dynamically. Error: {type(e).__name__}: {e}'
 			)
 			logger.error(f'First item in fetched data: {fetched_task_data[0] if fetched_task_data else "None"}')
 			exit(1)
