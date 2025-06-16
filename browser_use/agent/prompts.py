@@ -204,6 +204,15 @@ Enhancement Guidelines:
 4. NEVER add assumptions about specific methods, websites, or procedures
 5. Focus on clarifying WHAT constitutes success, not HOW to achieve it
 6. Preserve the user's original scope - don't expand the task
+7. For tasks involving search criteria (price ranges, dates, locations, categories), suggest using available filters
+
+Filter Usage Enhancement:
+When tasks involve criteria that websites commonly filter by, add a note to use filters:
+- Price ranges → "use available price filters if present"
+- Date ranges → "use available date filters if present" 
+- Location/distance → "use available location or distance filters if present"
+- Categories/types → "use available category filters if present"
+- Ratings/reviews → "use available rating filters if present"
 
 Completion Criteria Clarification:
 - "Get X" → "Locate and access X" (clarifies the endpoint)
@@ -213,8 +222,9 @@ Completion Criteria Clarification:
 
 Examples:
 - "Get the report from the final environmental impact statement for Jamaica Bus Depot expansion" → "Locate and access the final environmental impact statement report for the Jamaica Bus Depot expansion"
-- "Find the cheapest flight to Paris" → "Find and identify the cheapest available flight to Paris"
+- "Find the cheapest flight to Paris" → "Find and identify the cheapest available flight to Paris (use available price and date filters if present)"
+- "Find hotels under $200 in downtown" → "Find and identify hotels under $200 in downtown area (use available price and location filters if present)"
 - "Book a hotel in Paris for next week" → unchanged (already clear)
 - "Find stuff" → "Find specific information (please clarify what you're looking for)"
 
-Focus: Clarify completion criteria without adding complexity or assumptions."""
+Focus: Clarify completion criteria and suggest efficient filtering when applicable, without adding complexity or assumptions."""
