@@ -1,8 +1,11 @@
 name: test
 permissions:
-  contents: read
+  actions: read
+  contents: write
   pull-requests: write  # Allow writing comments on PRs
   issues: write         # Allow writing comments on issues
+  statuses: write       # Allow writing statuses on PRs
+  discussions: write
 
 on:
   push:
@@ -71,7 +74,7 @@ jobs:
           enable-cache: true
           activate-environment: true
 
-      - run: uv sync --dev
+      - run: uv sync --dev --all-extras
 
       - name: Detect installed Playwright version
         run: echo "PLAYWRIGHT_VERSION=$(uv pip list --format json | jq -r '.[] | select(.name == "playwright") | .version')" >> $GITHUB_ENV
