@@ -1926,7 +1926,10 @@ class Agent(Generic[Context]):
 			response = await self.llm.ainvoke(msg)
 			enhanced_task = response.content.strip()
 
-			self.logger.info(f"Task enhanced from: '{task}' to: '{enhanced_task}'")
+			if enhanced_task != task:
+				self.logger.info(f"Task enhanced from: '{task}' to: '{enhanced_task}'")
+			else:
+				self.logger.debug(f"Task unchanged: '{task}'")
 			return enhanced_task
 		except Exception as e:
 			self.logger.warning(f'Failed to enhance task: {e}')
