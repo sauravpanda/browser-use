@@ -14,13 +14,13 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
-# Test model
-class TestActionParams(ActionModel):
+# Test model - renamed to avoid pytest collection warnings
+class TestActionParamsModel(ActionModel):
 	value: str = Field(description='Test value')
 
 
-# Our Context type for the Registry
-class TestContext:
+# Our Context type for the Registry - renamed to avoid pytest collection warnings
+class TestContextHelper:
 	def __init__(self, value):
 		self.value = value
 
@@ -29,13 +29,13 @@ class TestContext:
 async def test_registry_param_handling():
 	"""Test how Registry handles parameter passing for different function signatures."""
 	# Create a Registry instance
-	registry = Registry[TestContext]()
+	registry = Registry[TestContextHelper]()
 
 	# Create test functions with different signatures
 
 	# 1. Function with browser_session as a positional parameter
-	@registry.action('Test action with browser_session', param_model=TestActionParams)
-	async def action_with_browser_session(params: TestActionParams, browser_session: BrowserSession):
+	@registry.action('Test action with browser_session', param_model=TestActionParamsModel)
+	async def action_with_browser_session(params: TestActionParamsModel, browser_session: BrowserSession):
 		logger.debug(f'action_with_browser_session called with params={params}, browser_session={browser_session}')
 		return {'params': params.model_dump(), 'has_browser': browser_session is not None}
 
@@ -51,7 +51,7 @@ async def test_registry_param_handling():
 
 	# 3. Function using **kwargs
 	@registry.action('Test action with kwargs')
-	async def action_with_kwargs(params: TestActionParams, **kwargs):
+	async def action_with_kwargs(params: TestActionParamsModel, **kwargs):
 		logger.debug(f'action_with_kwargs called with params={params}, kwargs={kwargs}')
 		return {'params': params.model_dump(), 'kwargs': kwargs}
 

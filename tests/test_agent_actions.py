@@ -6,7 +6,7 @@ from pydantic import BaseModel, SecretStr
 
 from browser_use.agent.service import Agent
 from browser_use.agent.views import AgentHistoryList
-from browser_use.browser import BrowserProfile, BrowserSession
+from browser_use.browser import BrowserSession
 
 
 @pytest.fixture
@@ -26,9 +26,8 @@ def llm():
 @pytest.fixture
 async def browser_session():
 	browser_session = BrowserSession(
-		browser_profile=BrowserProfile(
-			headless=True,
-		)
+		headless=True,
+		user_data_dir=None,
 	)
 	await browser_session.start()
 	yield browser_session

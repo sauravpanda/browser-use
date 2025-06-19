@@ -14,13 +14,13 @@ import asyncio
 import logging
 
 import pytest
-from playwright.async_api import Page
 from pydantic import Field
 from pytest_httpserver import HTTPServer
 from pytest_httpserver.httpserver import HandlerType
 
 from browser_use.agent.views import ActionResult
 from browser_use.browser import BrowserSession
+from browser_use.browser.types import Page
 from browser_use.controller.registry.service import Registry
 from browser_use.controller.registry.views import ActionModel as BaseActionModel
 from browser_use.controller.views import (
@@ -29,20 +29,11 @@ from browser_use.controller.views import (
 	NoParamsAction,
 	SearchGoogleAction,
 )
+from tests.ci.mocks import create_mock_llm
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
-
-
-class MockLLM:
-	"""Mock LLM for testing"""
-
-	async def ainvoke(self, prompt):
-		class MockResponse:
-			content = 'Mocked LLM response'
-
-		return MockResponse()
 
 
 class TestContext:
@@ -92,7 +83,7 @@ def base_url(http_server):
 @pytest.fixture(scope='module')
 def mock_llm():
 	"""Create a mock LLM"""
-	return MockLLM()
+	return create_mock_llm()
 
 
 @pytest.fixture(scope='function')
@@ -240,7 +231,9 @@ class TestActionRegistryParameterPatterns:
 		assert isinstance(result, ActionResult)
 		assert 'Text: hello' in result.extracted_content
 		assert base_url in result.extracted_content
-		assert 'LLM: Mocked LLM response' in result.extracted_content
+		# The mock LLM returns a JSON response
+		assert 'LLM: \n\t{\n\t\t"current_state":' in result.extracted_content
+		assert '"Task completed successfully"' in result.extracted_content
 		assert 'Files: 2' in result.extracted_content
 
 	async def test_no_params_action(self, registry, browser_session):
@@ -752,7 +745,7 @@ class TestValidationRules:
 		registry = Registry()
 
 		# Using 'page' with str type should error
-		with pytest.raises(ValueError, match='conflicts with special argument.*page: Page'):
+		with pytest.raises(ValueError, match=rf'conflicts with special argument.*page: {repr(Page)}'):
 
 			@registry.action('Navigate')
 			async def navigate_to_page(page: str, browser_session: BrowserSession):
@@ -834,7 +827,7 @@ class TestDecoratedFunctionBehavior:
 		special_context = {
 			'page': MockPage(),
 			'browser_session': None,
-			'page_extraction_llm': MockLLM(),
+			'page_extraction_llm': create_mock_llm(),
 			'context': {'extra': 'data'},
 			'unknown_param': 'ignored',
 		}
@@ -926,7 +919,7 @@ class TestErrorMessages:
 			error_msg = str(e)
 			assert 'page: str' in error_msg
 			assert 'conflicts' in error_msg
-			assert 'page: Page' in error_msg  # Show expected type
+			assert f'page: {repr(Page)}' in error_msg  # Show expected type
 			assert 'bad' in error_msg.lower()  # Show function name
 
 
@@ -999,6 +992,23 @@ class TestParameterOrdering:
 		# Verify the action was properly registered
 		assert action.name == 'extract_content'
 		assert action.description == 'Extract content from page'
+
+	async def test_page_error_retry(self, registry, browser_session):
+		"""Test that page errors trigger retry with fresh page"""
+		call_count = 0
+
+		@registry.action('Flaky page action', param_model=SimpleParams)
+		async def flaky_action(params: SimpleParams, page: Page):
+			nonlocal call_count
+			call_count += 1
+			if call_count == 1:
+				raise RuntimeError('page closed')
+			return ActionResult(extracted_content=f'Success on attempt {call_count}')
+
+		# Should retry once and succeed
+		result = await registry.execute_action('flaky_action', {'value': 'test'}, browser_session=browser_session)
+		assert 'Success on attempt 2' in result.extracted_content
+		assert call_count == 2
 
 
 class TestParamsModelArgsAndKwargs:

@@ -15,17 +15,24 @@ from typing import Any, Generic, TypeVar
 
 from dotenv import load_dotenv
 
-from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
+from browser_use.agent.cloud_events import (
+	CreateAgentOutputFileEvent,
+	CreateAgentSessionEvent,
+	CreateAgentStepEvent,
+	CreateAgentTaskEvent,
+	UpdateAgentTaskEvent,
+)
 
 load_dotenv()
 
+# from lmnr.sdk.decorators import observe
+from bubus import EventBus
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
 	BaseMessage,
 	HumanMessage,
 	SystemMessage,
 )
-from playwright.async_api import Browser, BrowserContext, Page
 from pydantic import BaseModel, ValidationError
 from uuid_extensions import uuid7str
 
@@ -41,6 +48,7 @@ from browser_use.agent.message_manager.utils import (
 from browser_use.agent.prompts import AgentMessagePrompt, PlannerPrompt, SystemPrompt, TaskEnhancementPrompt
 from browser_use.agent.views import (
 	ActionResult,
+	AgentBrain,
 	AgentError,
 	AgentHistory,
 	AgentHistoryList,
@@ -53,21 +61,16 @@ from browser_use.agent.views import (
 	ToolCallingMethod,
 )
 from browser_use.browser import BrowserProfile, BrowserSession
-
-# from lmnr.sdk.decorators import observe
+from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
+from browser_use.browser.types import Browser, BrowserContext, Page
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.controller.registry.views import ActionModel
 from browser_use.controller.service import Controller
-from browser_use.dom.history_tree_processor.service import (
-	DOMHistoryElement,
-	HistoryTreeProcessor,
-)
+from browser_use.dom.history_tree_processor.service import DOMHistoryElement, HistoryTreeProcessor
 from browser_use.exceptions import LLMException
 from browser_use.telemetry.service import ProductTelemetry
-from browser_use.telemetry.views import (
-	AgentTelemetryEvent,
-)
-from browser_use.utils import get_browser_use_version, time_execution_async, time_execution_sync
+from browser_use.telemetry.views import AgentTelemetryEvent
+from browser_use.utils import _log_pretty_path, get_browser_use_version, time_execution_async, time_execution_sync
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +118,7 @@ class Agent(Generic[Context]):
 		browser_session: BrowserSession | None = None,
 		controller: Controller[Context] = Controller(),
 		# Initial agent run parameters
-		sensitive_data: dict[str, str] | dict[str, dict[str, str]] | None = None,
+		sensitive_data: dict[str, str | dict[str, str]] | None = None,
 		initial_actions: list[dict[str, dict[str, Any]]] | None = None,
 		# Cloud Callbacks
 		register_new_step_callback: (
@@ -132,7 +135,7 @@ class Agent(Generic[Context]):
 		# Agent settings
 		use_vision: bool = True,
 		use_vision_for_planner: bool = False,
-		save_conversation_path: str | None = None,
+		save_conversation_path: str | Path | None = None,
 		save_conversation_path_encoding: str | None = 'utf-8',
 		max_failures: int = 3,
 		retry_delay: int = 10,
@@ -179,6 +182,9 @@ class Agent(Generic[Context]):
 		self.id = task_id or uuid7str()
 		self.task_id: str = self.id
 		self.session_id: str = uuid7str()
+
+		# Create instance-specific logger
+		self._logger = logging.getLogger(f'browser_use.Agent[{self.task_id[-3:]}]')
 
 		# Core components
 		self.task = task
@@ -338,11 +344,13 @@ class Agent(Generic[Context]):
 				# },
 			)
 		else:
+			if browser is not None:
+				assert isinstance(browser, Browser), 'Browser is not set up'
 			self.browser_session = BrowserSession(
 				browser_profile=browser_profile,
 				browser=browser,
 				browser_context=browser_context,
-				page=page,
+				agent_current_page=page,
 				id=uuid7str()[:-4] + self.id[-4:],  # re-use the same 4-char suffix so they show up together in logs
 			)
 
@@ -420,8 +428,25 @@ class Agent(Generic[Context]):
 		# Telemetry
 		self.telemetry = ProductTelemetry()
 
+		# Event bus with WAL persistence
+		# Default to ~/.config/browseruse/events/{agent_task_id}.jsonl
+		from browser_use.utils import BROWSER_USE_CONFIG_DIR
+
+		wal_path = BROWSER_USE_CONFIG_DIR / 'events' / f'{self.task_id}.jsonl'
+		self.eventbus = EventBus(name='Agent', wal_path=wal_path)
+
+		# Cloud sync service
+		self.enable_cloud_sync = os.environ.get('BROWSERUSE_CLOUD_SYNC', 'true').lower()[0] in 'ty1'
+		if self.enable_cloud_sync:
+			from browser_use.sync import CloudSync
+
+			self.cloud_sync = CloudSync()
+			# Register cloud sync handler
+			self.eventbus.on('*', self.cloud_sync.handle_event)
+
 		if self.settings.save_conversation_path:
-			self.logger.info(f'Saving conversation to {self.settings.save_conversation_path}')
+			self.settings.save_conversation_path = Path(self.settings.save_conversation_path).expanduser().resolve()
+			self.logger.info(f'💬 Saving conversation to {_log_pretty_path(self.settings.save_conversation_path)}')
 		self._external_pause_event = asyncio.Event()
 		self._external_pause_event.set()
 
@@ -431,18 +456,23 @@ class Agent(Generic[Context]):
 
 		_browser_session_id = self.browser_session.id if self.browser_session else self.id
 		_current_page_id = str(id(self.browser_session and self.browser_session.agent_current_page))[-2:]
-		return logging.getLogger(f'browser_use.Agent✻{self.task_id[-4:]} on ⛶{_browser_session_id[-4:]}.{_current_page_id}')
+		return logging.getLogger(f'browser_use.Agent🅰 {self.task_id[-4:]} on 🆂 {_browser_session_id[-4:]}.{_current_page_id}')
 
 	@property
 	def browser(self) -> Browser:
+		assert self.browser_session is not None, 'BrowserSession is not set up'
+		assert self.browser_session.browser is not None, 'Browser is not set up'
 		return self.browser_session.browser
 
 	@property
 	def browser_context(self) -> BrowserContext:
+		assert self.browser_session is not None, 'BrowserSession is not set up'
+		assert self.browser_session.browser_context is not None, 'BrowserContext is not set up'
 		return self.browser_session.browser_context
 
 	@property
 	def browser_profile(self) -> BrowserProfile:
+		assert self.browser_session is not None, 'BrowserSession is not set up'
 		return self.browser_session.browser_profile
 
 	def _set_message_context(self) -> str | None:
@@ -508,7 +538,7 @@ class Agent(Generic[Context]):
 		self.DoneActionModel = self.controller.registry.create_action_model(include_actions=['done'])
 		self.DoneAgentOutput = AgentOutput.type_with_custom_actions(self.DoneActionModel)
 
-	def _test_tool_calling_method(self, method: str) -> bool:
+	def _test_tool_calling_method(self, method: str | None) -> bool:
 		"""Test if a specific tool calling method works with the current LLM."""
 		try:
 			# Test configuration
@@ -648,9 +678,12 @@ class Agent(Generic[Context]):
 
 			# Process results in order of preference
 			for i, method in enumerate(methods_to_try):
-				if isinstance(results[i], tuple) and results[i][1]:  # (method, success)
-					self.llm._verified_api_keys = True
-					self.llm._verified_tool_calling_method = method  # Cache on LLM instance
+				if not isinstance(results, list):
+					continue
+				ith_result = results[i]
+				if isinstance(ith_result, tuple) and ith_result[1]:  # (method, success)
+					setattr(self.llm, '_verified_api_keys', True)
+					setattr(self.llm, '_verified_tool_calling_method', method)  # Cache on LLM instance
 					elapsed = time.time() - start_time
 					self.logger.debug(f'🛠️ Tested LLM in parallel and chose tool calling method: [{method}] in {elapsed:.2f}s')
 					return method
@@ -661,8 +694,8 @@ class Agent(Generic[Context]):
 			for method in methods_to_try:
 				if self._test_tool_calling_method(method):
 					# if we found the method which means api is verified.
-					self.llm._verified_api_keys = True
-					self.llm._verified_tool_calling_method = method  # Cache on LLM instance
+					setattr(self.llm, '_verified_api_keys', True)
+					setattr(self.llm, '_verified_tool_calling_method', method)  # Cache on LLM instance
 					elapsed = time.time() - start_time
 					self.logger.debug(f'🛠️ Tested LLM and chose tool calling method: [{method}] in {elapsed:.2f}s')
 					return method
@@ -727,8 +760,8 @@ class Agent(Generic[Context]):
 		if self.settings.tool_calling_method != 'auto':
 			# Skip test if already verified
 			if getattr(self.llm, '_verified_api_keys', None) is True or SKIP_LLM_API_KEY_VERIFICATION:
-				self.llm._verified_api_keys = True
-				self.llm._verified_tool_calling_method = self.settings.tool_calling_method
+				setattr(self.llm, '_verified_api_keys', True)
+				setattr(self.llm, '_verified_tool_calling_method', self.settings.tool_calling_method)
 				return self.settings.tool_calling_method
 
 			if not self._test_tool_calling_method(self.settings.tool_calling_method):
@@ -740,45 +773,45 @@ class Agent(Generic[Context]):
 						f"Configured tool calling method '{self.settings.tool_calling_method}' "
 						'is not supported by the current LLM.'
 					)
-			self.llm._verified_tool_calling_method = self.settings.tool_calling_method
+			setattr(self.llm, '_verified_tool_calling_method', self.settings.tool_calling_method)
 			return self.settings.tool_calling_method
 
 		# Check if we already have a cached method on this LLM instance
 		if hasattr(self.llm, '_verified_tool_calling_method'):
 			self.logger.debug(
-				f'🛠️ Using cached tool calling method for {self.chat_model_library}/{self.model_name}: [{self.llm._verified_tool_calling_method}]'
+				f'🛠️ Using cached tool calling method for {self.chat_model_library}/{self.model_name}: [{getattr(self.llm, "_verified_tool_calling_method")}]'
 			)
-			return self.llm._verified_tool_calling_method
+			return getattr(self.llm, '_verified_tool_calling_method')
 
 		# Try fast path for known model/library combinations
 		known_method = self._get_known_tool_calling_method()
 		if known_method is not None:
 			# Trust known combinations without testing if verification is already done or skipped
 			if getattr(self.llm, '_verified_api_keys', None) is True or SKIP_LLM_API_KEY_VERIFICATION:
-				self.llm._verified_api_keys = True
-				self.llm._verified_tool_calling_method = known_method  # Cache on LLM instance
+				setattr(self.llm, '_verified_api_keys', True)
+				setattr(self.llm, '_verified_tool_calling_method', known_method)  # Cache on LLM instance
 				self.logger.debug(
 					f'🛠️ Using known tool calling method for {self.chat_model_library}/{self.model_name}: [{known_method}] (skipped test)'
 				)
-				return known_method
+				return known_method  # type: ignore
 
 			start_time = time.time()
 			# Verify the known method works
 			if self._test_tool_calling_method(known_method):
-				self.llm._verified_api_keys = True
-				self.llm._verified_tool_calling_method = known_method  # Cache on LLM instance
+				setattr(self.llm, '_verified_api_keys', True)
+				setattr(self.llm, '_verified_tool_calling_method', known_method)  # Cache on LLM instance
 				elapsed = time.time() - start_time
 				self.logger.debug(
 					f'🛠️ Using known tool calling method for {self.chat_model_library}/{self.model_name}: [{known_method}] in {elapsed:.2f}s'
 				)
-				return known_method
+				return known_method  # type: ignore
 			# If known method fails, fall back to detection
 			self.logger.debug(
 				f'Known method {known_method} failed for {self.chat_model_library}/{self.model_name}, falling back to detection'
 			)
 
 		# Auto-detect the best method
-		return self._detect_best_tool_calling_method()
+		return self._detect_best_tool_calling_method()  # type: ignore
 
 	def add_new_task(self, new_task: str) -> None:
 		"""Add a new task to the agent, keeping the same task_id as tasks are continuous"""
@@ -809,6 +842,7 @@ class Agent(Generic[Context]):
 		tokens = 0
 
 		try:
+			assert self.browser_session is not None, 'BrowserSession is not set up'
 			browser_state_summary = await self.browser_session.get_state_summary(cache_clickable_elements_hashes=True)
 			current_page = await self.browser_session.get_current_page()
 
@@ -895,11 +929,14 @@ class Agent(Generic[Context]):
 
 					if not model_output.action or all(action.model_dump() == {} for action in model_output.action):
 						self.logger.warning('Model still returned empty after retry. Inserting safe noop action.')
-						action_instance = self.ActionModel(
-							done={
+						action_instance = self.ActionModel()
+						setattr(
+							action_instance,
+							'done',
+							{
 								'success': False,
 								'text': 'No next action returned by LLM!',
-							}
+							},
 						)
 						model_output.action = [action_instance]
 
@@ -914,8 +951,11 @@ class Agent(Generic[Context]):
 					else:
 						self.register_new_step_callback(browser_state_summary, model_output, self.state.n_steps)
 				if self.settings.save_conversation_path:
-					target = self.settings.save_conversation_path + f'_{self.state.n_steps}.txt'
-					save_conversation(input_messages, model_output, target, self.settings.save_conversation_path_encoding)
+					# Treat save_conversation_path as a directory (consistent with other recording paths)
+					conversation_dir = Path(self.settings.save_conversation_path)
+					conversation_filename = f'conversation_{self.id}_{self.state.n_steps}.txt'
+					target = conversation_dir / conversation_filename
+					await save_conversation(input_messages, model_output, target, self.settings.save_conversation_path_encoding)
 
 				self._message_manager._remove_last_state_message()  # we dont want the whole state in the chat history
 
@@ -979,7 +1019,20 @@ class Agent(Generic[Context]):
 			# Log step completion summary
 			self._log_step_completion_summary(step_start_time, result)
 
-	@time_execution_async('--handle_step_error')
+			# Emit both step created and executed events
+			if browser_state_summary and model_output:
+				# Extract key step data for the event
+				actions_data = []
+				if model_output.action:
+					for action in model_output.action:
+						action_dict = action.model_dump() if hasattr(action, 'model_dump') else {}
+						actions_data.append(action_dict)
+
+				# Emit CreateAgentStepEvent
+				step_event = CreateAgentStepEvent.from_agent_step(self, model_output, result, actions_data, browser_state_summary)
+				self.eventbus.dispatch(step_event)
+
+	@time_execution_async('--handle_step_error (agent)')
 	async def _handle_step_error(self, error: Exception) -> list[ActionResult]:
 		"""Handle all types of errors that can occur during a step"""
 		include_trace = self.logger.isEnabledFor(logging.DEBUG)
@@ -1131,7 +1184,7 @@ class Agent(Generic[Context]):
 				# Create action from tool call
 				action = {tool_call_name: tool_call_args}
 
-				parsed = self.AgentOutput(current_state=current_state, action=[self.ActionModel(**action)])
+				parsed = self.AgentOutput(current_state=AgentBrain(**current_state), action=[self.ActionModel(**action)])
 			else:
 				parsed = None
 		else:
@@ -1373,6 +1426,16 @@ class Agent(Generic[Context]):
 
 			self._log_agent_run()
 
+			# Initialize timing for session and task
+			self._session_start_time = time.time()
+			self._task_start_time = self._session_start_time  # Initialize task start time
+
+			# Emit CreateAgentSessionEvent at the START of run()
+			self.eventbus.dispatch(CreateAgentSessionEvent.from_agent(self))
+
+			# Emit CreateAgentTaskEvent at the START of run()
+			self.eventbus.dispatch(CreateAgentTaskEvent.from_agent(self))
+
 			# Execute initial actions if provided
 			if self.initial_actions:
 				result = await self.multi_act(self.initial_actions, check_for_new_elements=False)
@@ -1466,14 +1529,33 @@ class Agent(Generic[Context]):
 				# ADDED: Info message when custom telemetry for SIGINT was already logged
 				self.logger.info('Telemetry for force exit (SIGINT) was logged by custom exit callback.')
 
-			await self.close()
+			# NOTE: CreateAgentSessionEvent and CreateAgentTaskEvent are now emitted at the START of run()
+			# to match backend requirements for CREATE events to be fired when entities are created,
+			# not when they are completed
 
+			# Emit UpdateAgentTaskEvent at the END of run() with final task state
+			self.eventbus.dispatch(UpdateAgentTaskEvent.from_agent(self))
+
+			# Generate GIF if needed before stopping event bus
 			if self.settings.generate_gif:
 				output_path: str = 'agent_history.gif'
 				if isinstance(self.settings.generate_gif, str):
 					output_path = self.settings.generate_gif
 
 				create_history_gif(task=self.task, history=self.state.history, output_path=output_path)
+
+				# Emit output file generated event for GIF
+				output_event = await CreateAgentOutputFileEvent.from_agent_and_file(self, output_path)
+				self.eventbus.dispatch(output_event)
+
+			# Wait for cloud auth to complete if in progress
+			if self.enable_cloud_sync and hasattr(self, 'cloud_sync'):
+				await self.cloud_sync.wait_for_auth()
+
+			# Stop the event bus gracefully, waiting for all events to be processed
+			await self.eventbus.stop(timeout=5.0)
+
+			await self.close()
 
 	# @observe(name='controller.multi_act')
 	@time_execution_async('--multi_act')
@@ -1485,6 +1567,7 @@ class Agent(Generic[Context]):
 		"""Execute multiple actions"""
 		results = []
 
+		assert self.browser_session is not None, 'BrowserSession is not set up'
 		cached_selector_map = await self.browser_session.get_selector_map()
 		cached_path_hashes = {e.hash.branch_path_hash for e in cached_selector_map.values()}
 
@@ -1562,7 +1645,7 @@ class Agent(Generic[Context]):
 			f' example: {{"is_valid": false, "reason": "The user wanted to search for "cat photos", but the agent searched for "dog photos" instead."}}'
 		)
 
-		if self.browser_context:
+		if self.browser_context and self.browser_session:
 			browser_state_summary = await self.browser_session.get_state_summary(cache_clickable_elements_hashes=False)
 			assert browser_state_summary
 			content = AgentMessagePrompt(
@@ -1603,7 +1686,7 @@ class Agent(Generic[Context]):
 			self.logger.info('❌ Task completed without success')
 
 		total_tokens = self.state.history.total_input_tokens()
-		self.logger.debug(f'📝 Total input tokens used (approximate): {total_tokens}')
+		self.logger.debug(f'💲 Total input tokens used (approximate): {total_tokens}')
 
 		if self.register_done_callback:
 			if inspect.iscoroutinefunction(self.register_done_callback):
@@ -1673,6 +1756,7 @@ class Agent(Generic[Context]):
 
 	async def _execute_history_step(self, history_item: AgentHistory, delay: float) -> list[ActionResult]:
 		"""Execute a single step from history with element validation"""
+		assert self.browser_session is not None, 'BrowserSession is not set up'
 		state = await self.browser_session.get_state_summary(cache_clickable_elements_hashes=False)
 		if not state or not history_item.model_output:
 			raise ValueError('Invalid state or model output')
@@ -1769,10 +1853,11 @@ class Agent(Generic[Context]):
 
 		# playwright browser is always immediately killed by the first Ctrl+C (no way to stop that)
 		# so we need to restart the browser if user wants to continue
+		# the _init() method exists, even through its shows a linter error
 		if self.browser:
 			self.logger.info('🌎 Restarting/reconnecting to browser...')
 			loop = asyncio.get_event_loop()
-			loop.create_task(self.browser._init())
+			loop.create_task(self.browser._init())  # type: ignore
 			loop.create_task(asyncio.sleep(5))
 
 	def stop(self) -> None:
@@ -1804,7 +1889,7 @@ class Agent(Generic[Context]):
 
 		return converted_actions
 
-	def _verify_and_setup_llm(self) -> bool:
+	def _verify_and_setup_llm(self):
 		"""
 		Verify that the LLM API keys are setup and the LLM API is responding properly.
 		Also handles tool calling method detection if in auto mode.
@@ -1813,7 +1898,7 @@ class Agent(Generic[Context]):
 
 		# Skip verification if already done
 		if getattr(self.llm, '_verified_api_keys', None) is True or SKIP_LLM_API_KEY_VERIFICATION:
-			self.llm._verified_api_keys = True
+			setattr(self.llm, '_verified_api_keys', True)
 			return True
 
 	async def _run_planner(self) -> str | None:
@@ -1823,6 +1908,7 @@ class Agent(Generic[Context]):
 			return None
 
 		# Get current state to filter actions by page
+		assert self.browser_session is not None, 'BrowserSession is not set up'
 		page = await self.browser_session.get_current_page()
 
 		# Get all standard actions (no filter) and page-specific actions
@@ -1895,6 +1981,7 @@ class Agent(Generic[Context]):
 		"""Close all resources"""
 		try:
 			# First close browser resources
+			assert self.browser_session is not None, 'BrowserSession is not set up'
 			await self.browser_session.stop()
 
 			# Force garbage collection
