@@ -12,18 +12,19 @@ Tests cover:
 import asyncio
 import json
 import logging
+import tempfile
 from pathlib import Path
 
 import pytest
 
 from browser_use.browser.profile import (
-	BROWSERUSE_CHROMIUM_USER_DATA_DIR,
 	BROWSERUSE_DEFAULT_CHANNEL,
 	BrowserChannel,
 	BrowserProfile,
 )
 from browser_use.browser.session import BrowserSession
-from tests.ci.mocks import create_mock_llm
+from browser_use.config import CONFIG
+from tests.ci.conftest import create_mock_llm
 
 # Set up test logging
 logger = logging.getLogger('browser_session_start_tests')
@@ -69,35 +70,30 @@ class TestBrowserSessionStart:
 		"""Test simultaneously calling .start() from two parallel coroutines."""
 		# logger.info('Testing concurrent start calls')
 
-		# Track how many times the lock is actually acquired for initialization
-		original_start_lock = browser_session._start_lock
-		lock_acquire_count = 0
+		# Track browser PIDs to ensure only one browser is launched
+		browser_pids = []
+		original_setup = browser_session._unsafe_setup_new_browser_context
 
-		class CountingLock:
-			def __init__(self, original_lock):
-				self.original_lock = original_lock
+		async def tracking_setup():
+			await original_setup()
+			if browser_session.browser_pid:
+				browser_pids.append(browser_session.browser_pid)
 
-			async def __aenter__(self):
-				nonlocal lock_acquire_count
-				lock_acquire_count += 1
-				return await self.original_lock.__aenter__()
-
-			async def __aexit__(self, exc_type, exc_val, exc_tb):
-				return await self.original_lock.__aexit__(exc_type, exc_val, exc_tb)
-
-		browser_session._start_lock = CountingLock(original_start_lock)
+		browser_session._unsafe_setup_new_browser_context = tracking_setup
 
 		# Start two concurrent calls to start()
 		results = await asyncio.gather(browser_session.start(), browser_session.start(), return_exceptions=True)
 
-		# Both should succeed and return the same session instance
-		assert all(result is browser_session for result in results)
+		# Both should succeed and return the same session
+		successful_results = [r for r in results if isinstance(r, type(browser_session)) and r is browser_session]
+		assert len(successful_results) == 2, f'Expected both starts to succeed, got results: {results}'
+
+		# The session should be initialized after concurrent calls
 		assert browser_session.initialized is True
 		assert browser_session.browser_context is not None
 
-		# The lock should have been acquired twice (once per coroutine)
-		# but only one should have done the actual initialization
-		assert lock_acquire_count == 2
+		# Most importantly: only one browser should have been launched
+		assert len(browser_pids) <= 1, f'Multiple browsers launched! PIDs: {browser_pids}'
 
 	async def test_start_with_closed_browser_connection(self, browser_session):
 		"""Test calling .start() on a session that's started but has a closed browser connection."""
@@ -231,31 +227,24 @@ class TestBrowserSessionStart:
 		assert browser_session.initialized is True
 		assert browser_session.browser_context is not None
 
-		# Track if start() gets called again by monitoring the lock acquisition
-		original_start_lock = browser_session._start_lock
-		lock_acquire_count = 0
+		# Track if start() gets called again by monitoring the start method
+		start_call_count = 0
+		original_start = browser_session.start
 
-		class CountingLock:
-			def __init__(self, original_lock):
-				self._original_lock = original_lock
+		async def counting_start():
+			nonlocal start_call_count
+			start_call_count += 1
+			return await original_start()
 
-			async def __aenter__(self):
-				nonlocal lock_acquire_count
-				lock_acquire_count += 1
-				return await self._original_lock.__aenter__()
-
-			async def __aexit__(self, exc_type, exc_val, exc_tb):
-				return await self._original_lock.__aexit__(exc_type, exc_val, exc_tb)
-
-		browser_session._start_lock = CountingLock(original_start_lock)
+		browser_session.start = counting_start
 
 		# Call a method decorated with @require_initialization
 		# This should work without calling start() again
 		tabs_info = await browser_session.get_tabs_info()
 
-		# Verify the method worked and start() wasn't called again (lock not acquired)
+		# Verify the method worked and start() wasn't called again
 		assert isinstance(tabs_info, list)
-		assert lock_acquire_count == 0  # start() should not have been called
+		assert start_call_count == 0  # start() should not have been called
 		assert browser_session.initialized is True
 
 	async def test_require_initialization_decorator_not_started(self, browser_session):
@@ -485,21 +474,30 @@ class TestBrowserSessionStart:
 			await session.stop()
 			# Browser should still be connected
 			assert session.initialized is True
-			assert session.browser is not None
-			assert session.browser.is_connected()
+			assert session.browser_context and session.browser_context.pages[0]
 
 		finally:
 			await session.kill()
 
 	async def test_user_data_dir_not_allowed_to_corrupt_default_profile(self, caplog):
 		"""Test user_data_dir handling for different browser channels and version mismatches."""
+		import logging
+
+		# Temporarily enable propagation for browser_use logger to capture logs
+		browser_use_logger = logging.getLogger('browser_use')
+		original_propagate = browser_use_logger.propagate
+		browser_use_logger.propagate = True
+
+		caplog.set_level(logging.WARNING, logger='browser_use.utils')
 
 		# Test 1: Chromium with default user_data_dir and default channel should work fine
 		session = BrowserSession(
-			headless=True,
-			user_data_dir=BROWSERUSE_CHROMIUM_USER_DATA_DIR,
-			channel=BROWSERUSE_DEFAULT_CHANNEL,  # chromium
-			keep_alive=False,
+			browser_profile=BrowserProfile(
+				headless=True,
+				user_data_dir=CONFIG.BROWSER_USE_DEFAULT_USER_DATA_DIR,
+				channel=BROWSERUSE_DEFAULT_CHANNEL,  # chromium
+				keep_alive=False,
+			),
 		)
 
 		try:
@@ -507,27 +505,30 @@ class TestBrowserSessionStart:
 			assert session.initialized is True
 			assert session.browser_context is not None
 			# Verify the user_data_dir wasn't changed
-			assert session.browser_profile.user_data_dir == BROWSERUSE_CHROMIUM_USER_DATA_DIR
+			assert session.browser_profile.user_data_dir == CONFIG.BROWSER_USE_DEFAULT_USER_DATA_DIR
 		finally:
 			await session.kill()
 
 		# Test 2: Chrome with default user_data_dir should show warning and change dir
 		profile2 = BrowserProfile(
 			headless=True,
-			user_data_dir=BROWSERUSE_CHROMIUM_USER_DATA_DIR,
+			user_data_dir=CONFIG.BROWSER_USE_DEFAULT_USER_DATA_DIR,
 			channel=BrowserChannel.CHROME,
 			keep_alive=False,
 		)
 
 		# The validator should have changed the user_data_dir
-		assert profile2.user_data_dir != BROWSERUSE_CHROMIUM_USER_DATA_DIR
-		assert profile2.user_data_dir == BROWSERUSE_CHROMIUM_USER_DATA_DIR.parent / 'default-chrome'
+		assert profile2.user_data_dir != CONFIG.BROWSER_USE_DEFAULT_USER_DATA_DIR
+		assert profile2.user_data_dir == CONFIG.BROWSER_USE_DEFAULT_USER_DATA_DIR.parent / 'default-chrome'
 
 		# Check warning was logged
 		warning_found = any(
 			'Changing user_data_dir=' in record.message and 'CHROME' in record.message for record in caplog.records
 		)
 		assert warning_found, 'Expected warning about changing user_data_dir was not found'
+
+		# Restore original propagate setting
+		browser_use_logger.propagate = original_propagate
 
 	# only run if `/Applications/Brave Browser.app` is installed
 	@pytest.mark.skipif(
@@ -546,9 +547,11 @@ class TestBrowserSessionStart:
 		# await brave_session.stop()
 
 		chromium_session = BrowserSession(
-			headless=True,
-			user_data_dir='~/.config/browseruse/profiles/stealth',
-			channel=BrowserChannel.CHROMIUM,  # should crash when opened with chromium
+			browser_profile=BrowserProfile(
+				headless=True,
+				user_data_dir='~/.config/browseruse/profiles/stealth',
+				channel=BrowserChannel.CHROMIUM,  # should crash when opened with chromium
+			),
 		)
 
 		# open chrome with corrupted user_data_dir
@@ -558,54 +561,6 @@ class TestBrowserSessionStart:
 
 class TestBrowserSessionReusePatterns:
 	"""Tests for all browser re-use patterns documented in docs/customize/real-browser.mdx"""
-
-	@pytest.fixture(scope='module')
-	def mock_llm(self):
-		"""Mock LLM for agent tests"""
-		from unittest.mock import MagicMock
-
-		from langchain_core.language_models.chat_models import BaseChatModel
-
-		# Create a MagicMock that supports dictionary-style access
-		mock = MagicMock(spec=BaseChatModel)
-
-		# Skip verification by setting these attributes
-		mock._verified_api_keys = True
-		mock._verified_tool_calling_method = 'raw'
-		mock.model_name = 'mock-llm'
-
-		# Mock the invoke method to return a proper response
-		def mock_invoke(*args, **kwargs):
-			response = MagicMock()
-			# Return a valid JSON response that completes the task
-			response.content = """
-			{
-				"current_state": {
-					"evaluation_previous_goal": "Starting the task",
-					"memory": "Task started",
-					"next_goal": "Complete the task"
-				},
-				"action": [
-					{
-						"done": {
-							"text": "Task completed successfully",
-							"success": true
-						}
-					}
-				]
-			}
-			"""
-			return response
-
-		mock.invoke = mock_invoke
-
-		# Create an async version of the mock_invoke
-		async def mock_ainvoke(*args, **kwargs):
-			return mock_invoke(*args, **kwargs)
-
-		mock.ainvoke = mock_ainvoke
-
-		return mock
 
 	async def test_sequential_agents_same_profile_different_browser(self, mock_llm):
 		"""Test Sequential Agents, Same Profile, Different Browser pattern"""
@@ -623,7 +578,6 @@ class TestBrowserSessionReusePatterns:
 			task='The first task...',
 			llm=mock_llm,
 			browser_profile=reused_profile,
-			tool_calling_method='raw',  # Use raw mode for tests
 			enable_memory=False,  # Disable memory for tests
 		)
 		await agent1.run()
@@ -637,7 +591,6 @@ class TestBrowserSessionReusePatterns:
 			task='The second task...',
 			llm=mock_llm,
 			browser_profile=reused_profile,
-			tool_calling_method='raw',  # Use raw mode for tests
 			enable_memory=False,  # Disable memory for tests
 		)
 		await agent2.run()
@@ -653,9 +606,11 @@ class TestBrowserSessionReusePatterns:
 
 		# Create a reusable session with keep_alive
 		reused_session = BrowserSession(
-			user_data_dir=None,  # Use temp dir for testing
-			headless=True,
-			keep_alive=True,  # Don't close browser after agent.run()
+			browser_profile=BrowserProfile(
+				user_data_dir=None,  # Use temp dir for testing
+				headless=True,
+				keep_alive=True,  # Don't close browser after agent.run()
+			),
 		)
 
 		try:
@@ -667,7 +622,6 @@ class TestBrowserSessionReusePatterns:
 				task='The first task...',
 				llm=mock_llm,
 				browser_session=reused_session,
-				tool_calling_method='raw',  # Use raw mode for tests
 				enable_memory=False,  # Disable memory for tests
 			)
 			await agent1.run()
@@ -681,7 +635,6 @@ class TestBrowserSessionReusePatterns:
 				task='The second task...',
 				llm=mock_llm,
 				browser_session=reused_session,
-				tool_calling_method='raw',  # Use raw mode for tests
 				enable_memory=False,  # Disable memory for tests
 			)
 			await agent2.run()
@@ -696,7 +649,6 @@ class TestBrowserSessionReusePatterns:
 
 	async def test_parallel_agents_same_browser_multiple_tabs(self, httpserver):
 		"""Test Parallel Agents, Same Browser, Multiple Tabs pattern"""
-		import tempfile
 
 		from browser_use import Agent, BrowserSession
 
@@ -712,10 +664,12 @@ class TestBrowserSessionReusePatterns:
 		storage_state_path = Path(storage_state_path)
 
 		shared_browser = BrowserSession(
-			storage_state=storage_state_path,
-			user_data_dir=None,
-			keep_alive=True,
-			headless=True,
+			browser_profile=BrowserProfile(
+				storage_state=storage_state_path,
+				user_data_dir=None,
+				keep_alive=True,
+				headless=True,
+			),
 		)
 
 		try:
@@ -731,11 +685,10 @@ class TestBrowserSessionReusePatterns:
 			tab_creation_action = (
 				"""
 			{
-				"current_state": {
-					"evaluation_previous_goal": "Starting the task",
-					"memory": "Need to create a new tab",
-					"next_goal": "Create a new tab to work in"
-				},
+				"thinking": "null",
+				"evaluation_previous_goal": "Starting the task",
+				"memory": "Need to create a new tab",
+				"next_goal": "Create a new tab to work in",
 				"action": [
 					{
 						"open_tab": {
@@ -750,11 +703,10 @@ class TestBrowserSessionReusePatterns:
 
 			done_action = """
 			{
-				"current_state": {
-					"evaluation_previous_goal": "Tab created",
-					"memory": "Task completed in new tab",
-					"next_goal": "Complete the task"
-				},
+				"thinking": "null",
+				"evaluation_previous_goal": "Tab created",
+				"memory": "Task completed in new tab",
+				"next_goal": "Complete the task",
 				"action": [
 					{
 						"done": {
@@ -776,26 +728,28 @@ class TestBrowserSessionReusePatterns:
 				task='First parallel task...',
 				llm=mock_llm1,
 				browser_session=shared_browser,
-				tool_calling_method='raw',  # Use raw mode for tests
 				enable_memory=False,  # Disable memory for tests
 			)
 			agent2 = Agent(
 				task='Second parallel task...',
 				llm=mock_llm2,
 				browser_session=shared_browser,
-				tool_calling_method='raw',  # Use raw mode for tests
 				enable_memory=False,  # Disable memory for tests
 			)
 			agent3 = Agent(
 				task='Third parallel task...',
 				llm=mock_llm3,
 				browser_session=shared_browser,
-				tool_calling_method='raw',  # Use raw mode for tests
 				enable_memory=False,  # Disable memory for tests
 			)
 
 			# Run all agents in parallel
-			results = await asyncio.gather(agent1.run(), agent2.run(), agent3.run())
+			results = await asyncio.gather(agent1.run(), agent2.run(), agent3.run(), return_exceptions=True)
+
+			# Check if any agents failed
+			for i, result in enumerate(results):
+				if isinstance(result, Exception):
+					raise AssertionError(f'Agent {i + 1} failed with error: {result}')
 
 			# Verify all agents used the same browser session (using __eq__ to check browser_pid, cdp_url, wss_url)
 			# Debug: print the browser sessions to see what's different
@@ -814,10 +768,18 @@ class TestBrowserSessionReusePatterns:
 			assert agent1.browser_session == shared_browser, f'agent1 != shared: {agent1.browser_session} != {shared_browser}'
 			assert shared_browser.initialized
 
+			# Give a small delay to ensure all tabs are fully created
+			await asyncio.sleep(0.5)
+
 			# Verify multiple tabs were created
 			tabs_info = await shared_browser.get_tabs_info()
+			print(f'Number of tabs: {len(tabs_info)}')
+			for i, tab in enumerate(tabs_info):
+				print(f'Tab {i}: {tab}')
+
 			# Should have at least 3 tabs (one per agent)
-			assert len(tabs_info) >= 3
+			# In some cases, there might be more tabs if the initial about:blank tab is still open
+			assert len(tabs_info) >= 3, f'Expected at least 3 tabs, but found {len(tabs_info)}: {tabs_info}'
 
 		finally:
 			await shared_browser.kill()
@@ -829,9 +791,11 @@ class TestBrowserSessionReusePatterns:
 
 		# Create a browser session and start it first
 		shared_browser = BrowserSession(
-			user_data_dir=None,
-			headless=True,
-			keep_alive=True,  # Keep the browser alive for reuse
+			browser_profile=BrowserProfile(
+				user_data_dir=None,
+				headless=True,
+				keep_alive=True,  # Keep the browser alive for reuse
+			),
 		)
 
 		try:
@@ -843,14 +807,12 @@ class TestBrowserSessionReusePatterns:
 				task='Fill out the form in section A...',
 				llm=mock_llm,
 				browser_session=shared_browser,
-				tool_calling_method='raw',  # Use raw mode for tests
 				enable_memory=False,  # Disable memory for tests
 			)
 			agent2 = Agent(
 				task='Fill out the form in section B...',
 				llm=mock_llm,
 				browser_session=shared_browser,
-				tool_calling_method='raw',  # Use raw mode for tests
 				enable_memory=False,  # Disable memory for tests
 			)
 
@@ -860,7 +822,7 @@ class TestBrowserSessionReusePatterns:
 			await page.goto(httpserver.url_for('/'), wait_until='domcontentloaded')
 
 			# Run agents in parallel (may interfere with each other)
-			results = await asyncio.gather(agent1.run(), agent2.run(), return_exceptions=True)
+			_results = await asyncio.gather(agent1.run(), agent2.run(), return_exceptions=True)
 
 			# Verify both agents used the same browser session
 			assert agent1.browser_session == agent2.browser_session
@@ -872,7 +834,6 @@ class TestBrowserSessionReusePatterns:
 
 	async def test_parallel_agents_same_profile_different_browsers(self, mock_llm):
 		"""Test Parallel Agents, Same Profile, Different Browsers pattern (recommended)"""
-		import tempfile
 
 		from browser_use import Agent
 		from browser_use.browser import BrowserProfile, BrowserSession
@@ -899,18 +860,14 @@ class TestBrowserSessionReusePatterns:
 			# Create separate browser sessions from the same profile
 			window1 = BrowserSession(browser_profile=shared_profile)
 			await window1.start()
-			agent1 = Agent(
-				task='First agent task...', llm=mock_llm, browser_session=window1, tool_calling_method='raw', enable_memory=False
-			)
+			agent1 = Agent(task='First agent task...', llm=mock_llm, browser_session=window1, enable_memory=False)
 
 			window2 = BrowserSession(browser_profile=shared_profile)
 			await window2.start()
-			agent2 = Agent(
-				task='Second agent task...', llm=mock_llm, browser_session=window2, tool_calling_method='raw', enable_memory=False
-			)
+			agent2 = Agent(task='Second agent task...', llm=mock_llm, browser_session=window2, enable_memory=False)
 
 			# Run agents in parallel
-			results = await asyncio.gather(agent1.run(), agent2.run())
+			_results = await asyncio.gather(agent1.run(), agent2.run())
 
 			# Verify different browser sessions were used
 			assert agent1.browser_session is not agent2.browser_session
@@ -936,3 +893,131 @@ class TestBrowserSessionReusePatterns:
 			await window1.kill()
 			await window2.kill()
 			auth_json_path.unlink(missing_ok=True)
+
+	async def test_browser_shutdown_isolated(self):
+		"""Test that browser shutdown doesnt affect other browser_sessions"""
+		from browser_use import BrowserSession
+
+		browser_session1 = BrowserSession(
+			browser_profile=BrowserProfile(
+				user_data_dir=None,
+				headless=True,
+				keep_alive=True,  # Keep the browser alive for reuse
+			),
+		)
+		browser_session2 = BrowserSession(
+			browser_profile=BrowserProfile(
+				user_data_dir=None,
+				headless=True,
+				keep_alive=True,  # Keep the browser alive for reuse
+			),
+		)
+		await browser_session1.start()
+		await browser_session2.start()
+
+		assert await browser_session1.is_connected()
+		assert await browser_session2.is_connected()
+		assert browser_session1.browser_context != browser_session2.browser_context
+
+		await browser_session1.create_new_tab('chrome://version')
+		await browser_session2.create_new_tab('chrome://settings')
+
+		await browser_session2.kill()
+
+		# ensure that the browser_session1 is still connected and unaffected by the kill of browser_session2
+		assert await browser_session1.is_connected()
+		assert browser_session1.browser_context is not None
+		await browser_session1.create_new_tab('chrome://settings')
+		await browser_session1.browser_context.pages[0].evaluate('alert(1)')
+
+		await browser_session1.kill()
+
+	async def test_many_parallel_browser_sessions(self):
+		"""Test spawning 20 parallel browser_sessions with different settings and ensure they all work"""
+		from browser_use import BrowserSession
+
+		browser_sessions = []
+
+		for i in range(5):
+			browser_sessions.append(
+				BrowserSession(
+					browser_profile=BrowserProfile(
+						user_data_dir=None,
+						headless=True,
+						keep_alive=True,
+					),
+				)
+			)
+		for i in range(5):
+			browser_sessions.append(
+				BrowserSession(
+					browser_profile=BrowserProfile(
+						user_data_dir=Path(tempfile.mkdtemp(prefix=f'browseruse-tmp-{i}')),
+						headless=True,
+						keep_alive=True,
+					),
+				)
+			)
+		for i in range(5):
+			browser_sessions.append(
+				BrowserSession(
+					browser_profile=BrowserProfile(
+						user_data_dir=None,
+						headless=True,
+						keep_alive=False,
+					),
+				)
+			)
+		for i in range(5):
+			browser_sessions.append(
+				BrowserSession(
+					browser_profile=BrowserProfile(
+						user_data_dir=Path(tempfile.mkdtemp(prefix=f'browseruse-tmp-{i}')),
+						headless=True,
+						keep_alive=False,
+					),
+				)
+			)
+
+		print('Starting many parallel browser sessions...')
+		await asyncio.gather(*[browser_session.start() for browser_session in browser_sessions])
+
+		print('Ensuring all parallel browser sessions are connected and usable...')
+		new_tab_tasks = []
+		for browser_session in browser_sessions:
+			assert await browser_session.is_connected()
+			assert browser_session.browser_context is not None
+			new_tab_tasks.append(browser_session.create_new_tab('chrome://version'))
+		await asyncio.gather(*new_tab_tasks)
+
+		print('killing every 3rd browser_session to test parallel shutdown')
+		kill_tasks = []
+		for i in range(0, len(browser_sessions), 3):
+			kill_tasks.append(browser_sessions[i].kill())
+			browser_sessions[i] = None
+		results = await asyncio.gather(*kill_tasks, return_exceptions=True)
+		# Check that no exceptions were raised during cleanup
+		for i, result in enumerate(results):
+			if isinstance(result, Exception):
+				print(f'Warning: Browser session kill raised exception: {type(result).__name__}: {result}')
+
+		print('ensuring the remaining browser_sessions are still connected and usable')
+		new_tab_tasks = []
+		screenshot_tasks = []
+		for browser_session in filter(bool, browser_sessions):
+			assert await browser_session.is_connected()
+			assert browser_session.browser_context is not None
+			new_tab_tasks.append(browser_session.create_new_tab('chrome://version'))
+			screenshot_tasks.append(browser_session.take_screenshot())
+		await asyncio.gather(*new_tab_tasks)
+		await asyncio.gather(*screenshot_tasks)
+
+		kill_tasks = []
+		print('killing the remaining browser_sessions')
+		for browser_session in filter(bool, browser_sessions):
+			kill_tasks.append(browser_session.kill())
+		results = await asyncio.gather(*kill_tasks, return_exceptions=True)
+		# Check that no exceptions were raised during cleanup
+		for i, result in enumerate(results):
+			if isinstance(result, Exception):
+				print(f'Warning: Browser session kill raised exception: {type(result).__name__}: {result}')

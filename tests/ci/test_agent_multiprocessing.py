@@ -15,15 +15,11 @@ import asyncio
 import logging
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import AsyncMock
-
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage
 
 from browser_use import Agent, setup_logging
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.browser.types import async_playwright
-from tests.ci.mocks import create_mock_llm
+from tests.ci.conftest import create_mock_llm
 
 # Set up test logging
 setup_logging()
@@ -42,41 +38,11 @@ def run_agent_in_subprocess_module(task_description):
 
 	async def run_agent():
 		# Create mock LLM inline to avoid pickling issues
-		mock_llm = AsyncMock(spec=BaseChatModel)
-		mock_llm._verified_api_keys = True
-		mock_llm._verified_tool_calling_method = 'raw'
-		mock_llm.model_name = 'mock-llm'
-
-		response_content = """
-		{
-			"current_state": {
-				"evaluation_previous_goal": "Starting the task",
-				"memory": "Task completed",
-				"next_goal": "Complete the task"
-			},
-			"action": [
-				{
-					"done": {
-						"text": "Task completed successfully",
-						"success": true
-					}
-				}
-			]
-		}
-		"""
-
-		mock_llm.invoke.return_value = AIMessage(content=response_content)
-
-		# Make ainvoke return a coroutine
-		async def async_invoke(*args, **kwargs):
-			return AIMessage(content=response_content)
-
-		mock_llm.ainvoke.side_effect = async_invoke
+		mock_llm = create_mock_llm()
 
 		agent = Agent(
 			task=task_description,
 			llm=mock_llm,
-			tool_calling_method='raw',
 			enable_memory=False,
 			browser_profile=BrowserProfile(headless=True, user_data_dir=None),
 		)
@@ -88,7 +54,7 @@ def run_agent_in_subprocess_module(task_description):
 		if len(result.history) > 0:
 			last_history = result.history[-1]
 			if last_history.model_output and last_history.model_output.action:
-				has_done = any(hasattr(action, 'done') for action in last_history.model_output.action)
+				has_done = any('done' in action.model_dump(include={'done'}) for action in last_history.model_output.action)
 		return {'success': has_done, 'error': None}
 	except Exception as e:
 		return {'success': False, 'error': str(e)}
@@ -125,7 +91,6 @@ class TestParallelism:
 		agent = Agent(
 			task='Test task',
 			llm=mock_llm,
-			tool_calling_method='raw',
 			enable_memory=False,
 			browser_profile=BrowserProfile(headless=True, user_data_dir=None),
 		)
@@ -137,7 +102,7 @@ class TestParallelism:
 		# Check that the last action was 'done'
 		last_history = result.history[-1]
 		if last_history.model_output and last_history.model_output.action:
-			assert any(hasattr(action, 'done') for action in last_history.model_output.action)
+			assert any('done' in action.model_dump(include={'done'}) for action in last_history.model_output.action)
 
 	async def test_one_event_loop_two_parallel_agents(self):
 		"""Test one event loop with two different parallel agents"""
@@ -148,9 +113,11 @@ class TestParallelism:
 
 		# Create a shared browser session
 		browser_session = BrowserSession(
-			headless=True,
-			user_data_dir=None,  # Use temp directory
-			keep_alive=True,
+			browser_profile=BrowserProfile(
+				headless=True,
+				user_data_dir=None,  # Use temp directory
+				keep_alive=True,
+			)
 		)
 
 		try:
@@ -161,7 +128,6 @@ class TestParallelism:
 				task='First parallel task',
 				llm=mock_llm,
 				browser_session=browser_session,
-				tool_calling_method='raw',
 				enable_memory=False,
 			)
 
@@ -169,7 +135,6 @@ class TestParallelism:
 				task='Second parallel task',
 				llm=mock_llm,
 				browser_session=browser_session,
-				tool_calling_method='raw',
 				enable_memory=False,
 			)
 
@@ -182,10 +147,11 @@ class TestParallelism:
 				assert len(result.history) > 0
 				last_history = result.history[-1]
 				if last_history.model_output and last_history.model_output.action:
-					assert any(hasattr(action, 'done') for action in last_history.model_output.action)
+					assert any('done' in action.model_dump(include={'done'}) for action in last_history.model_output.action)
 
-			# Verify they used different browser sessions
-			assert agent1.browser_session is not agent2.browser_session
+			# Verify they share the same browser session (new behavior)
+			assert agent1.browser_session is agent2.browser_session
+			assert agent1.browser_session is browser_session
 		finally:
 			await browser_session.kill()
 
@@ -198,9 +164,11 @@ class TestParallelism:
 
 		# Create a shared browser session
 		browser_session = BrowserSession(
-			headless=True,
-			user_data_dir=None,  # Use temp directory
-			keep_alive=True,
+			browser_profile=BrowserProfile(
+				headless=True,
+				user_data_dir=None,  # Use temp directory
+				keep_alive=True,
+			)
 		)
 
 		try:
@@ -211,7 +179,6 @@ class TestParallelism:
 				task='First sequential task',
 				llm=mock_llm,
 				browser_session=browser_session,
-				tool_calling_method='raw',
 				enable_memory=False,
 			)
 			result1 = await agent1.run()
@@ -221,7 +188,6 @@ class TestParallelism:
 				task='Second sequential task',
 				llm=mock_llm,
 				browser_session=browser_session,
-				tool_calling_method='raw',
 				enable_memory=False,
 			)
 			result2 = await agent2.run()
@@ -231,10 +197,11 @@ class TestParallelism:
 				assert len(result.history) > 0
 				last_history = result.history[-1]
 				if last_history.model_output and last_history.model_output.action:
-					assert any(hasattr(action, 'done') for action in last_history.model_output.action)
+					assert any('done' in action.model_dump(include={'done'}) for action in last_history.model_output.action)
 
-			# Verify they used different browser sessions
-			assert agent1.browser_session is not agent2.browser_session
+			# Verify they share the same browser session (new behavior)
+			assert agent1.browser_session is agent2.browser_session
+			assert agent1.browser_session is browser_session
 		finally:
 			await browser_session.kill()
 
@@ -250,7 +217,6 @@ class TestParallelism:
 		agent1 = Agent(
 			task='First loop task',
 			llm=mock_llm,
-			tool_calling_method='raw',
 			enable_memory=False,
 			browser_profile=BrowserProfile(headless=True, user_data_dir=None),
 		)
@@ -259,7 +225,6 @@ class TestParallelism:
 		agent2 = Agent(
 			task='Second loop task',
 			llm=mock_llm,
-			tool_calling_method='raw',
 			enable_memory=False,
 			browser_profile=BrowserProfile(headless=True, user_data_dir=None),
 		)
@@ -270,7 +235,7 @@ class TestParallelism:
 			assert len(result.history) > 0
 			last_history = result.history[-1]
 			if last_history.model_output and last_history.model_output.action:
-				assert any(hasattr(action, 'done') for action in last_history.model_output.action)
+				assert any('done' in action.model_dump(include={'done'}) for action in last_history.model_output.action)
 
 	async def test_two_event_loops_one_per_thread(self):
 		"""Test two event loops, one per thread, with one agent in each loop"""
@@ -293,7 +258,6 @@ class TestParallelism:
 					agent = Agent(
 						task=task_description,
 						llm=mock_llm,
-						tool_calling_method='raw',
 						enable_memory=False,
 						browser_profile=BrowserProfile(headless=True, user_data_dir=None),
 					)
@@ -340,7 +304,7 @@ class TestParallelism:
 			assert len(result.history) > 0
 			last_history = result.history[-1]
 			if last_history.model_output and last_history.model_output.action:
-				assert any(hasattr(action, 'done') for action in last_history.model_output.action)
+				assert any('done' in action.model_dump(include={'done'}) for action in last_history.model_output.action)
 
 	def test_two_subprocesses_one_agent_per_subprocess(self):
 		"""Test two subprocesses, with one agent per subprocess"""
@@ -364,11 +328,10 @@ class TestParallelism:
 		# Create action sequences - each agent creates a new tab
 		tab_action = """
 		{
-			"current_state": {
-				"evaluation_previous_goal": "Starting task",
-				"memory": "Need new tab",
-				"next_goal": "Create new tab"
-			},
+			"thinking": "null",
+			"evaluation_previous_goal": "Starting task",
+			"memory": "Need new tab",
+			"next_goal": "Create new tab",
 			"action": [
 				{
 					"open_tab": {
@@ -381,11 +344,10 @@ class TestParallelism:
 
 		done_action = """
 		{
-			"current_state": {
-				"evaluation_previous_goal": "Tab created",
-				"memory": "Task done",
-				"next_goal": "Complete"
-			},
+			"thinking": "null",
+			"evaluation_previous_goal": "Tab created",
+			"memory": "Task done",
+			"next_goal": "Complete",
 			"action": [
 				{
 					"done": {
@@ -403,9 +365,11 @@ class TestParallelism:
 
 		# Create shared browser session
 		shared_session = BrowserSession(
-			headless=True,
-			user_data_dir=None,
-			keep_alive=True,
+			browser_profile=BrowserProfile(
+				headless=True,
+				user_data_dir=None,
+				keep_alive=True,
+			)
 		)
 
 		try:
@@ -416,7 +380,6 @@ class TestParallelism:
 				task='Task in tab 1',
 				llm=mock_llm1,
 				browser_session=shared_session,
-				tool_calling_method='raw',
 				enable_memory=False,
 			)
 
@@ -424,7 +387,6 @@ class TestParallelism:
 				task='Task in tab 2',
 				llm=mock_llm2,
 				browser_session=shared_session,
-				tool_calling_method='raw',
 				enable_memory=False,
 			)
 
@@ -436,7 +398,7 @@ class TestParallelism:
 				assert len(result.history) > 0
 				last_history = result.history[-1]
 				if last_history.model_output and last_history.model_output.action:
-					assert any(hasattr(action, 'done') for action in last_history.model_output.action)
+					assert any('done' in action.model_dump(include={'done'}) for action in last_history.model_output.action)
 
 			# Verify multiple tabs were created
 			tabs = await shared_session.get_tabs_info()
@@ -462,9 +424,11 @@ class TestParallelism:
 
 		# Create a session with keep_alive
 		session = BrowserSession(
-			headless=True,
-			user_data_dir=None,
-			keep_alive=True,
+			browser_profile=BrowserProfile(
+				headless=True,
+				user_data_dir=None,
+				keep_alive=True,
+			)
 		)
 
 		try:
@@ -476,7 +440,6 @@ class TestParallelism:
 				task='First task',
 				llm=mock_llm,
 				browser_session=session,
-				tool_calling_method='raw',
 				enable_memory=False,
 			)
 			result1 = await agent1.run()
@@ -490,7 +453,6 @@ class TestParallelism:
 				task='Second task',
 				llm=mock_llm,
 				browser_session=session,
-				tool_calling_method='raw',
 				enable_memory=False,
 			)
 			result2 = await agent2.run()
@@ -500,7 +462,7 @@ class TestParallelism:
 				assert len(result.history) > 0
 				last_history = result.history[-1]
 				if last_history.model_output and last_history.model_output.action:
-					assert any(hasattr(action, 'done') for action in last_history.model_output.action)
+					assert any('done' in action.model_dump(include={'done'}) for action in last_history.model_output.action)
 			assert session.browser_pid == initial_browser_pid
 
 		finally:
@@ -517,13 +479,15 @@ class TestParallelism:
 
 			# Create session with existing playwright objects
 			browser_session = BrowserSession(
-				page=page,
+				browser_profile=BrowserProfile(
+					headless=True,
+					user_data_dir=None,
+					keep_alive=False,
+				),
+				agent_current_page=page,
 				browser_context=context,
 				browser=browser,
 				playwright=playwright,
-				headless=True,
-				user_data_dir=None,
-				keep_alive=False,
 			)
 
 			# Create mock LLM
@@ -534,7 +498,6 @@ class TestParallelism:
 				task='Test with existing playwright objects',
 				llm=mock_llm,
 				browser_session=browser_session,
-				tool_calling_method='raw',
 				enable_memory=False,
 			)
 
@@ -545,8 +508,12 @@ class TestParallelism:
 			assert len(result.history) > 0
 			last_history = result.history[-1]
 			if last_history.model_output and last_history.model_output.action:
-				assert any(hasattr(action, 'done') for action in last_history.model_output.action)
+				assert any('done' in action.model_dump(include={'done'}) for action in last_history.model_output.action)
 
 			await browser.close()
 			await browser_session.kill()
 		await playwright.stop()
+
+
+if __name__ == '__main__':
+	asyncio.run(TestParallelism().test_one_event_loop_with_asyncio_run_and_one_task())

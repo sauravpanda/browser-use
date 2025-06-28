@@ -5,12 +5,12 @@ Cloud sync service for sending events to the Browser Use cloud.
 import asyncio
 import json
 import logging
-import os
 
 import anyio
 import httpx
 from bubus import BaseEvent
 
+from browser_use.config import CONFIG
 from browser_use.sync.auth import TEMP_USER_ID, DeviceAuthClient
 
 logger = logging.getLogger(__name__)
@@ -21,10 +21,10 @@ class CloudSync:
 
 	def __init__(self, base_url: str | None = None, enable_auth: bool = True):
 		# Backend API URL for all API requests - can be passed directly or defaults to env var
-		self.base_url = base_url or os.getenv('BROWSER_USE_CLOUD_URL', 'https://cloud.browser-use.com')
+		self.base_url = base_url or CONFIG.BROWSER_USE_CLOUD_API_URL
 		self.enable_auth = enable_auth
 		self.auth_client = DeviceAuthClient(base_url=self.base_url) if enable_auth else None
-		self.pending_events: list[dict] = []
+		self.pending_events: list[BaseEvent] = []
 		self.auth_task = None
 		self.session_id: str | None = None
 
@@ -32,68 +32,89 @@ class CloudSync:
 		"""Handle an event by sending it to the cloud"""
 		try:
 			# Extract session ID from CreateAgentSessionEvent
-			if event.event_type == 'CreateAgentSession' and hasattr(event, 'id'):
-				self.session_id = event.id
+			if event.event_type == 'CreateAgentSessionEvent' and hasattr(event, 'id'):
+				self.session_id = str(event.id)  # type: ignore
 
-				# Start authentication flow if enabled and not authenticated
-				if self.enable_auth and self.auth_client and not self.auth_client.is_authenticated:
-					# Start auth in background
-					self.auth_task = asyncio.create_task(self._background_auth(agent_session_id=self.session_id))
-
-			# Prepare event data
-			event_data = self._prepare_event_data(event)
+			# Start authentication flow on first step (after first LLM response)
+			if event.event_type == 'CreateAgentStepEvent' and 'step' in dict(event):
+				step = dict(event)['step']
+				# logger.debug(f'Got CreateAgentStepEvent with step={step}')
+				# Trigger on the first step (step=2 because n_steps is incremented before actions)
+				if step == 2 and self.enable_auth and self.auth_client:
+					if not hasattr(self, 'auth_task') or self.auth_task is None:
+						# Start auth in background
+						if self.session_id:
+							# logger.info('Triggering auth on first step event')
+							# Always run auth to show the cloud URL, even if already authenticated
+							self.auth_task = asyncio.create_task(self._background_auth(agent_session_id=self.session_id))
+						else:
+							logger.warning('Cannot start auth - session_id not set yet')
 
 			# Send event to cloud
-			await self._send_event(event_data)
+			await self._send_event(event)
 
 		except Exception as e:
-			logger.warning(f'Failed to send event to cloud: {e}')
+			logger.error(f'Failed to handle {event.event_type} event: {type(e).__name__}: {e}', exc_info=True)
 
-	def _prepare_event_data(self, event: BaseEvent) -> dict:
-		"""Prepare event data for cloud API"""
-		# Get user_id from auth client or use temp ID
-		user_id = self.auth_client.user_id if self.auth_client else TEMP_USER_ID
-
-		# Update event with user_id
-		event_dict = event.model_dump(mode='json')  # Use JSON mode to handle datetime serialization
-		event_dict['user_id'] = user_id
-
-		# Prepare API request format
-		return {
-			'event_type': event.event_type,
-			'event_id': event_dict.get('event_id', event_dict.get('id', '')),
-			'event_at': event_dict.get('event_at', event_dict.get('created_at', '')),
-			'event_schema': f'{event.__class__.__name__}@1.0',
-			'data': event_dict,
-		}
-
-	async def _send_event(self, event_data: dict) -> None:
+	async def _send_event(self, event: BaseEvent) -> None:
 		"""Send event to cloud API"""
-		headers = {}
+		try:
+			headers = {}
 
-		# Add auth headers if available
-		if self.auth_client:
-			headers.update(self.auth_client.get_headers())
-
-		# Send event
-		async with httpx.AsyncClient() as client:
-			response = await client.post(
-				f'{self.base_url.rstrip("/")}/api/v1/events/',
-				json={'events': [event_data]},
-				headers=headers,
-				timeout=10.0,
-			)
-
-			if response.status_code == 401 and self.auth_client and not self.auth_client.is_authenticated:
-				# Store event for retry after auth
-				self.pending_events.append(event_data)
+			# override user_id on event with auth client user_id if available
+			if self.auth_client:
+				event.user_id = str(self.auth_client.user_id)  # type: ignore
 			else:
-				response.raise_for_status()
+				event.user_id = TEMP_USER_ID  # type: ignore
+
+			# Add auth headers if available
+			if self.auth_client:
+				headers.update(self.auth_client.get_headers())
+
+			# Send event (batch format with direct BaseEvent serialization)
+			async with httpx.AsyncClient() as client:
+				response = await client.post(
+					f'{self.base_url.rstrip("/")}/api/v1/events',
+					json={'events': [event.model_dump(mode='json')]},
+					headers=headers,
+					timeout=10.0,
+				)
+
+				if response.status_code == 401 and self.auth_client and not self.auth_client.is_authenticated:
+					# Store event for retry after auth
+					self.pending_events.append(event)
+				elif response.status_code >= 400:
+					# Log error but don't raise - we want to fail silently
+					logger.debug(
+						f'Failed to send sync event: POST {response.request.url} {response.status_code} - {response.text}'
+					)
+		except httpx.TimeoutException:
+			logger.warning(f'⚠️ Event send timed out after 10 seconds: {event}')
+		except httpx.ConnectError as e:
+			logger.warning(f'⚠️ Failed to connect to cloud service at {self.base_url}: {e}')
+		except httpx.HTTPError as e:
+			logger.warning(f'⚠️ HTTP error sending event {event}: {type(e).__name__}: {e}')
+		except Exception as e:
+			logger.warning(f'⚠️ Unexpected error sending event {event}: {type(e).__name__}: {e}')
 
 	async def _background_auth(self, agent_session_id: str) -> None:
-		"""Run authentication in background"""
+		"""Run authentication in background or show cloud URL if already authenticated"""
+		assert self.auth_client, 'enable_auth=True must be set before calling CloudSync_background_auth()'
+		assert self.session_id, 'session_id must be set before calling CloudSync._background_auth() can fire'
 		try:
-			# Run authentication
+			# If already authenticated, just show the cloud URL
+			if self.auth_client.is_authenticated:
+				# Use frontend URL for user-facing links
+				frontend_url = CONFIG.BROWSER_USE_CLOUD_UI_URL or self.base_url.replace('//api.', '//cloud.')
+				session_url = f'{frontend_url.rstrip("/")}/agent/{agent_session_id}'
+
+				logger.info('\n\n' + '─' * 70)
+				logger.info('🌐  View the details of this run in Browser Use Cloud:')
+				logger.info(f'    👉  {session_url}')
+				logger.info('─' * 70 + '\n')
+				return
+
+			# Otherwise run full authentication
 			success = await self.auth_client.authenticate(
 				agent_session_id=agent_session_id,
 				show_instructions=True,
@@ -107,22 +128,17 @@ class CloudSync:
 				await self._update_wal_user_ids(agent_session_id)
 
 		except Exception as e:
-			logger.warning(f'Background authentication failed: {e}')
+			logger.debug(f'Cloud sync authentication failed: {e}')
 
 	async def _resend_pending_events(self) -> None:
 		"""Resend events that were queued during auth"""
 		if not self.pending_events:
 			return
 
-		# Update user_id in pending events
-		user_id = self.auth_client.user_id
-		for event_data in self.pending_events:
-			event_data['data']['user_id'] = user_id
-
 		# Send all pending events
-		for event_data in self.pending_events:
+		for event in self.pending_events:
 			try:
-				await self._send_event(event_data)
+				await self._send_event(event)
 			except Exception as e:
 				logger.warning(f'Failed to resend pending event: {e}')
 
@@ -131,11 +147,13 @@ class CloudSync:
 	async def _update_wal_user_ids(self, session_id: str) -> None:
 		"""Update user IDs in WAL file after authentication"""
 		try:
-			from browser_use.utils import BROWSER_USE_CONFIG_DIR
+			assert self.auth_client, 'Cloud sync must be authenticated to update WAL user ID'
 
-			wal_path = BROWSER_USE_CONFIG_DIR / 'events' / f'{session_id}.jsonl'
+			wal_path = CONFIG.BROWSER_USE_CONFIG_DIR / 'events' / f'{session_id}.jsonl'
 			if not await anyio.Path(wal_path).exists():
-				return
+				raise FileNotFoundError(
+					f'CloudSync failed to update saved event user_ids after auth: Agent EventBus WAL file not found: {wal_path}'
+				)
 
 			# Read all events
 			events = []
@@ -161,22 +179,6 @@ class CloudSync:
 		"""Wait for authentication to complete if in progress"""
 		if self.auth_task and not self.auth_task.done():
 			await self.auth_task
-
-	async def send_event(self, event_type: str, event_data: dict, event_schema: str) -> None:
-		"""Send a single event to the cloud - convenience method for tests"""
-		# Create a dynamic subclass that includes the custom event data
-		from pydantic import ConfigDict, Field
-
-		etype = event_type
-
-		class CustomEvent(BaseEvent):
-			model_config = ConfigDict(
-				extra='allow', arbitrary_types_allowed=True, validate_assignment=True, validate_default=True
-			)
-			event_type: str = Field(default=etype, frozen=True)
-
-		CustomEvent.__name__ = etype
-		await self.handle_event(CustomEvent(**event_data))
 
 	async def authenticate(self, show_instructions: bool = True) -> bool:
 		"""Authenticate with the cloud service"""

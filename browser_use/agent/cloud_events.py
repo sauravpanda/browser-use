@@ -1,12 +1,16 @@
+import base64
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 
+import anyio
 from bubus import BaseEvent
 from pydantic import Field, field_validator
 from uuid_extensions import uuid7str
 
-MAX_STRING_LENGTH = 10000  # 10K chars for most strings
-MAX_URL_LENGTH = 2000
-MAX_TASK_LENGTH = 5000
+MAX_STRING_LENGTH = 100000  # 100K chars ~ 25k tokens should be enough
+MAX_URL_LENGTH = 100000
+MAX_TASK_LENGTH = 100000
 MAX_COMMENT_LENGTH = 2000
 MAX_FILE_CONTENT_SIZE = 50 * 1024 * 1024  # 50MB
 
@@ -41,6 +45,9 @@ class UpdateAgentTaskEvent(BaseEvent):
 			done_output=done_output,
 			finished_at=datetime.now(timezone.utc) if agent.state.history and agent.state.history.is_done() else None,
 			agent_state=agent.state.model_dump() if hasattr(agent.state, 'model_dump') else {},
+			user_feedback_type=None,
+			user_comment=None,
+			gif_url=None,
 			# user_feedback_type and user_comment would be set by the API/frontend
 			# gif_url would be set after GIF generation if needed
 		)
@@ -74,11 +81,6 @@ class CreateAgentOutputFileEvent(BaseEvent):
 	@classmethod
 	async def from_agent_and_file(cls, agent, output_path: str) -> 'CreateAgentOutputFileEvent':
 		"""Create a CreateAgentOutputFileEvent from a file path"""
-		import base64
-		import os
-		from pathlib import Path
-
-		import anyio
 
 		gif_path = Path(output_path)
 		if not gif_path.exists():
@@ -185,13 +187,16 @@ class CreateAgentTaskEvent(BaseEvent):
 			user_id='',  # To be filled by cloud handler
 			agent_session_id=str(agent.session_id),
 			task=agent.task,
-			llm_model=agent.model_name,
+			llm_model=agent.llm.model_name,
 			agent_state=agent.state.model_dump() if hasattr(agent.state, 'model_dump') else {},
 			stopped=False,
 			paused=False,
 			done_output=None,
 			started_at=datetime.fromtimestamp(agent._task_start_time, tz=timezone.utc),
 			finished_at=None,
+			user_feedback_type=None,
+			user_comment=None,
+			gif_url=None,
 		)
 
 
